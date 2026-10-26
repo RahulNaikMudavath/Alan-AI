@@ -81,3 +81,53 @@ CREATE TABLE IF NOT EXISTS memory_embeddings (
 -- Supports "all vectors for this model" scans without touching other models.
 CREATE INDEX IF NOT EXISTS idx_memory_embeddings_model
     ON memory_embeddings (model);
+
+-- Conversation receipts.
+--
+-- The primary key is (user_id, conversation_id): a client-chosen id is only
+-- unique within a user, and it doubles as the idempotency key. `payload_hash`
+-- lets a retry be told apart from a different payload sent under the same id.
+-- `result_json` is the exact response returned the first time, so a replay is
+-- cheap and stable even if a memory has since been edited or deleted.
+CREATE TABLE IF NOT EXISTS conversations (
+    user_id          TEXT NOT NULL,
+    conversation_id  TEXT NOT NULL,
+    agent_id         TEXT,
+    message_count    INTEGER NOT NULL,
+    memories_created INTEGER NOT NULL,
+    memories_skipped INTEGER NOT NULL,
+    extractor        TEXT NOT NULL,
+    payload_hash     TEXT NOT NULL,
+    result_json      TEXT NOT NULL,
+    created_at       TEXT NOT NULL,
+    PRIMARY KEY (user_id, conversation_id)
+);
+
+-- Which messages produced which memory. Indexes are 0-based positions in the
+-- submitted conversation. Cascades with the memory so provenance never
+-- outlives what it describes.
+CREATE TABLE IF NOT EXISTS memory_sources (
+    memory_id       TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    user_id         TEXT NOT NULL,
+    conversation_id TEXT NOT NULL,
+    message_indexes TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    PRIMARY KEY (memory_id, conversation_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_sources_conversation
+    ON memory_sources (user_id, conversation_id);
+
+-- Opt-in raw message storage (RECALLKIT_STORE_MESSAGES). Off by default: the
+-- extracted facts are the product, the conversation is the most sensitive data
+-- RecallKit could otherwise hold.
+CREATE TABLE IF NOT EXISTS conversation_messages (
+    user_id         TEXT NOT NULL,
+    conversation_id TEXT NOT NULL,
+    position        INTEGER NOT NULL,
+    role            TEXT NOT NULL,
+    content         TEXT NOT NULL,
+    PRIMARY KEY (user_id, conversation_id, position),
+    FOREIGN KEY (user_id, conversation_id)
+        REFERENCES conversations (user_id, conversation_id) ON DELETE CASCADE
+);
