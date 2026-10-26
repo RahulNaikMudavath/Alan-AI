@@ -22,9 +22,15 @@ class Database:
         self.path = Path(path)
 
     def connect(self) -> sqlite3.Connection:
-        """Open a new connection with row access by column name."""
+        """Open a new connection with row access by column name.
+
+        Foreign keys are off by default in SQLite and must be enabled on every
+        connection. RecallKit relies on the cascade from ``memories`` to
+        ``memory_embeddings``, so this is not optional.
+        """
         connection = sqlite3.connect(self.path, timeout=5.0, check_same_thread=False)
         connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
         return connection
 
     def initialize(self) -> None:
