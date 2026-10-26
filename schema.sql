@@ -1,5 +1,11 @@
--- RecallKit database schema.
--- Statement is idempotent: init_db() runs it on every application startup.
+-- RecallKit BASELINE database schema.
+--
+-- This file creates the tables that existed before versioned migrations. It is
+-- applied only by the explicit `python -m app.cli init` / `migrate` commands,
+-- never by application startup. Later changes live in app/migrations/ and are
+-- tracked by PRAGMA user_version.
+--
+-- Statements are idempotent so re-applying the baseline is safe.
 
 CREATE TABLE IF NOT EXISTS memories (
     id         TEXT PRIMARY KEY,

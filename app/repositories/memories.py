@@ -384,17 +384,19 @@ class MemoryRepository:
 
         The ``status = 'active'`` predicate makes concurrent supersessions safe:
         exactly one caller can win. Returns None when the row changed.
+
+        Does **not** commit: callers run this inside a transaction so the status
+        change and the conflict closure are atomic.
         """
-        with self._connection:
-            cursor = self._connection.execute(
-                """
-                UPDATE memories
-                SET status = 'superseded', superseded_at = ?, superseded_by = ?,
-                    superseded_reason = ?, superseded_note = ?
-                WHERE id = ? AND user_id = ? AND status = 'active'
-                """,
-                (at, superseded_by, reason, note, memory_id, user_id),
-            )
+        cursor = self._connection.execute(
+            """
+            UPDATE memories
+            SET status = 'superseded', superseded_at = ?, superseded_by = ?,
+                superseded_reason = ?, superseded_note = ?
+            WHERE id = ? AND user_id = ? AND status = 'active'
+            """,
+            (at, superseded_by, reason, note, memory_id, user_id),
+        )
         if cursor.rowcount == 0:
             return None
         return self.get(memory_id, user_id=user_id)

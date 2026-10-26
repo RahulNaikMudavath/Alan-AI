@@ -232,6 +232,7 @@ class ConflictService:
         scanned = 0
         found: list[str] = []
         existing = 0
+        seen: set[tuple[str, str]] = set()
         with transaction(self._connection):
             memories, _ = self._memories.list(
                 user_id=user_id,
@@ -242,7 +243,12 @@ class ConflictService:
             for memory in memories:
                 scanned += 1
                 pairs = self._pairs(memory)
-                for conflict_id, inserted in self._insert_pairs_with_status(user_id, pairs, now):
+                # A scan sees each pair from both sides. Evaluate it once.
+                fresh_pairs = [pair for pair in pairs if (pair[0], pair[1]) not in seen]
+                seen.update((pair[0], pair[1]) for pair in pairs)
+                for conflict_id, inserted in self._insert_pairs_with_status(
+                    user_id, fresh_pairs, now
+                ):
                     if inserted:
                         found.append(conflict_id)
                     else:
