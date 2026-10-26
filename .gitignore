@@ -1,0 +1,24 @@
+# Virtual environment
+.venv/
+venv/
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# Local database files (never commit real data)
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# Local environment overrides (secrets belong here, never in git)
+.env
+
+# Editor / OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
