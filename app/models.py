@@ -8,11 +8,14 @@ new column cannot leak by accident.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 MemoryKind = Literal["fact", "preference", "event", "task"]
+MemoryStatus = Literal["active", "superseded"]
+MemoryStatusFilter = Literal["active", "superseded", "all"]
+SupersedeReason = Literal["user_correction", "outdated", "contradiction", "duplicate", "other"]
 
 
 def _strip_non_blank(value: str | None) -> str | None:
@@ -75,7 +78,11 @@ class MemoryUpdate(BaseModel):
 
 
 class Memory(BaseModel):
-    """A stored memory as returned by the API."""
+    """A stored memory as returned by the API.
+
+    The lifecycle fields are additive and defaulted so receipts written before
+    Milestone 3.3 still deserialize.
+    """
 
     id: str
     user_id: str
@@ -84,6 +91,11 @@ class Memory(BaseModel):
     kind: MemoryKind
     created_at: datetime
     updated_at: datetime
+    status: MemoryStatus = "active"
+    superseded_at: datetime | None = None
+    superseded_by: str | None = None
+    superseded_reason: SupersedeReason | None = None
+    superseded_note: str | None = None
 
 
 class MemoryList(BaseModel):
@@ -167,3 +179,269 @@ class HealthResponse(BaseModel):
 
     status: Literal["ok", "error"]
     database: Literal["ok", "error"]
+
+
+# -- conversation ingestion ------------------------------------------------
+
+MessageRole = Literal["user", "assistant", "system", "tool"]
+
+# Absolute ceilings enforced by the schema, before any configuration is
+# consulted. They protect the process from a hostile payload; the configurable
+# limits in Settings are usually stricter and produce friendlier 422 messages.
+MAX_MESSAGE_CHARS = 32000
+MAX_MESSAGES = 200
+MAX_CONVERSATION_CHARS = 200_000
+
+# The model is asked for at most this many items. More than this is treated as
+# a provider contract violation rather than silently truncating.
+MAX_RAW_FACTS = 100
+
+# Individual facts may be longer than the configured limit; the service reports
+# those as skipped ("too_long") instead of failing the whole request.
+MAX_FACT_CONTENT_CHARS = 4000
+
+SkipReason = Literal[
+    "duplicate_existing",
+    "duplicate_in_request",
+    "low_confidence",
+    "too_long",
+    "invalid_fact",
+    "limit_exceeded",
+    "duplicate_superseded",
+]
+
+
+class ConversationMessage(BaseModel):
+    """One message in the submitted conversation. Treated as untrusted data."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    role: MessageRole
+    content: str = Field(min_length=1, max_length=MAX_MESSAGE_CHARS)
+
+    @field_validator("content")
+    @classmethod
+    def _must_not_be_blank(cls, value: str) -> str:
+        return _strip_non_blank(value) or ""
+
+
+class ConversationIngestRequest(BaseModel):
+    """Body of ``POST /conversations``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    user_id: str = Field(min_length=1, max_length=128)
+    # Client-supplied so retries can be idempotent. Scoped by user_id, so two
+    # users may use the same value independently.
+    conversation_id: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9._:-]+$",
+        description="Client-owned idempotency key, unique within a user.",
+    )
+    agent_id: str | None = Field(default=None, max_length=128)
+    messages: list[ConversationMessage] = Field(min_length=1, max_length=MAX_MESSAGES)
+
+    @field_validator("user_id", "agent_id", "conversation_id")
+    @classmethod
+    def _must_not_be_blank(cls, value: str | None) -> str | None:
+        return _strip_non_blank(value)
+
+    @model_validator(mode="after")
+    def _within_absolute_size(self) -> ConversationIngestRequest:
+        total = sum(len(message.content) for message in self.messages)
+        if total > MAX_CONVERSATION_CHARS:
+            raise ValueError(
+                f"conversation exceeds the absolute limit of {MAX_CONVERSATION_CHARS} characters"
+            )
+        return self
+
+
+class ExtractedFact(BaseModel):
+    """One fact as claimed by the extraction model.
+
+    Strict on purpose: the model's output is untrusted, and this is the only
+    shape allowed to become a memory row.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    content: str = Field(min_length=1, max_length=MAX_FACT_CONTENT_CHARS)
+    kind: MemoryKind
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+    source_message_indexes: list[int] = Field(default_factory=list, max_length=50)
+
+    @field_validator("content")
+    @classmethod
+    def _must_not_be_blank(cls, value: str) -> str:
+        return _strip_non_blank(value) or ""
+
+
+class RawExtraction(BaseModel):
+    """Top-level model output.
+
+    Items are validated individually by the service so one bad fact becomes a
+    skip instead of failing the whole conversation.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    memories: list[Any] = Field(max_length=MAX_RAW_FACTS)
+
+
+class SkippedMemory(BaseModel):
+    """A candidate that was understood but deliberately not stored."""
+
+    content: str
+    kind: str | None = None
+    reason: SkipReason
+    source_message_indexes: list[int] = Field(default_factory=list)
+
+
+class ExtractorInfo(BaseModel):
+    provider: str
+    model: str
+    prompt_version: str
+
+
+class ConversationIngestResponse(BaseModel):
+    conversation_id: str
+    replayed: bool
+    messages_received: int
+    memories_created: list[Memory]
+    memories_skipped: list[SkippedMemory]
+    extractor: ExtractorInfo
+
+
+# -- lifecycle and explainability ------------------------------------------
+
+
+class SupersedeRequest(BaseModel):
+    """Body of ``POST /memories/{id}/supersede``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    superseded_by: str = Field(min_length=1, max_length=64)
+    reason: SupersedeReason
+    note: str | None = Field(default=None, max_length=500)
+
+    @field_validator("note")
+    @classmethod
+    def _clean_note(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        return value or None
+
+
+class SupersedeResponse(BaseModel):
+    superseded: Memory
+    replacement: Memory
+
+
+ConflictStatus = Literal["open", "resolved"]
+ConflictResolution = Literal["kept_a", "kept_b", "kept_both", "superseded"]
+ConflictStatusFilter = Literal["open", "resolved", "all"]
+
+
+class ConflictRead(BaseModel):
+    """A candidate contradiction, with both memories and the evidence."""
+
+    id: str
+    status: ConflictStatus
+    rule: str
+    evidence: dict[str, Any]
+    resolution: ConflictResolution | None
+    detected_at: datetime
+    resolved_at: datetime | None
+    memory_a: Memory
+    memory_b: Memory
+
+
+class ConflictList(BaseModel):
+    items: list[ConflictRead]
+    total: int
+    limit: int
+    offset: int
+
+
+class ConflictResolveRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    user_id: str = Field(min_length=1, max_length=128)
+    resolution: Literal["keep_a", "keep_b", "keep_both"]
+    note: str | None = Field(default=None, max_length=500)
+
+    @field_validator("user_id")
+    @classmethod
+    def _must_not_be_blank(cls, value: str) -> str:
+        return _strip_non_blank(value) or ""
+
+    @field_validator("note")
+    @classmethod
+    def _clean_note(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        return value or None
+
+
+class ConflictResolveResponse(BaseModel):
+    conflict: ConflictRead
+    superseded: Memory | None = None
+    replacement: Memory | None = None
+
+
+class ConflictScanResponse(BaseModel):
+    scanned: int
+    conflicts_found: int
+    conflicts_existing: int
+
+
+class ExplainSource(BaseModel):
+    conversation_id: str
+    message_indexes: list[int]
+    conversation_created_at: datetime
+    extractor: ExtractorInfo | None
+
+
+class ExplainIndexes(BaseModel):
+    keyword: bool
+    embedding_models: list[str]
+
+
+class ExplainLifecycle(BaseModel):
+    status: MemoryStatus
+    superseded_at: datetime | None
+    superseded_by: str | None
+    reason: SupersedeReason | None
+    note: str | None
+
+
+class ExplainObserved(BaseModel):
+    """Facts read directly from stored rows."""
+
+    origin: Literal["direct", "conversation"]
+    sources: list[ExplainSource]
+    indexes: ExplainIndexes
+    lifecycle: ExplainLifecycle
+
+
+class ExplainConflictCandidate(BaseModel):
+    """A heuristic candidate. Evidence only; never a confidence score."""
+
+    conflict_id: str
+    other_memory_id: str
+    rule: str
+    evidence: dict[str, Any]
+    status: ConflictStatus
+
+
+class ExplainInferred(BaseModel):
+    conflict_candidates: list[ExplainConflictCandidate]
+
+
+class MemoryExplainResponse(BaseModel):
+    memory: Memory
+    observed: ExplainObserved
+    inferred: ExplainInferred
