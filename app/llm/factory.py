@@ -6,9 +6,12 @@ confusing runtime error on the first write.
 """
 
 from app.config import Settings
-from app.llm.base import EmbeddingProvider
-from app.llm.fake import DeterministicEmbeddingProvider
-from app.llm.openai_compatible import OpenAICompatibleEmbeddingProvider
+from app.llm.base import EmbeddingProvider, LLMProvider
+from app.llm.fake import DeterministicEmbeddingProvider, DeterministicLLMProvider
+from app.llm.openai_compatible import (
+    OpenAICompatibleEmbeddingProvider,
+    OpenAICompatibleLLMProvider,
+)
 
 
 def build_embedding_provider(settings: Settings) -> EmbeddingProvider | None:
@@ -37,3 +40,32 @@ def build_embedding_provider(settings: Settings) -> EmbeddingProvider | None:
 
     # Unreachable while the setting is a Literal, kept for a future provider.
     raise ValueError(f"unknown embedding provider: {settings.embedding_provider}")
+
+
+def build_llm_provider(settings: Settings) -> LLMProvider | None:
+    """Return the configured extraction provider, or None when disabled."""
+    if settings.llm_provider == "none":
+        return None
+
+    if settings.llm_provider == "fake":
+        return DeterministicLLMProvider()
+
+    if settings.llm_provider == "openai_compatible":
+        if settings.llm_api_key is None or not (settings.llm_api_key.get_secret_value().strip()):
+            raise ValueError(
+                "RECALLKIT_LLM_API_KEY must be set when RECALLKIT_LLM_PROVIDER=openai_compatible"
+            )
+        if not settings.llm_model:
+            raise ValueError(
+                "RECALLKIT_LLM_MODEL must be set when RECALLKIT_LLM_PROVIDER=openai_compatible"
+            )
+        return OpenAICompatibleLLMProvider(
+            base_url=settings.llm_base_url,
+            api_key=settings.llm_api_key.get_secret_value(),
+            model=settings.llm_model,
+            timeout=settings.llm_timeout_seconds,
+            json_mode=settings.llm_json_mode,
+        )
+
+    # Unreachable while the setting is a Literal, kept for a future provider.
+    raise ValueError(f"unknown llm provider: {settings.llm_provider}")
