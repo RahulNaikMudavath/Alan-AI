@@ -93,6 +93,15 @@ class Settings(BaseSettings):
     # they are not written to disk unless a deployment opts in.
     store_messages: bool = False
 
+    # -- conflict candidates -----------------------------------------------
+    # Detection is advisory only: it never changes a memory's status.
+    conflict_detection_enabled: bool = True
+    # Containment of the smaller token set. A lexical observation, not a
+    # confidence score; raise it to be even more conservative.
+    conflict_overlap_threshold: float = Field(default=0.8, ge=0.5, le=1.0)
+    conflict_candidate_limit: int = Field(default=20, ge=1, le=100)
+    conflict_scan_limit: int = Field(default=500, ge=1)
+
     @field_validator("database_path")
     @classmethod
     def _resolve_against_project_root(cls, value: Path) -> Path:
