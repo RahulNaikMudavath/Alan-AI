@@ -8,8 +8,9 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 
-# Local database files (never commit real data)
+# Local database backups
 data/
+backups/
 *.db
 *.db-wal
 *.db-shm
