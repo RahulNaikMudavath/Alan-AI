@@ -4,20 +4,22 @@ Persistent memory for AI agents. RecallKit is a small REST API that stores
 facts, preferences and events per user in SQLite and returns them on demand, so
 an agent can remember useful context between conversations.
 
-This repository currently contains **Milestone 3.1**: create, read, list,
-keyword search, update and delete, plus vector embeddings and retrieval by
-meaning (semantic and hybrid). Every operation is scoped to one user. There is
-no authentication, conversation ingestion, or automatic fact extraction yet.
+This repository currently contains **Milestone 3.2**: create, read, list,
+keyword search, update and delete, retrieval by meaning (semantic and hybrid),
+and conversation ingestion that extracts memories through a replaceable model
+provider. Every operation is scoped to one user. There is no authentication,
+conflict supersession, or frontend yet.
 
 ## Requirements
 
 - Python 3.11 or newer (developed and tested on Python 3.14)
 - Windows PowerShell (commands below), or the equivalent on macOS/Linux
 
-No API keys are needed. The default embedding provider is a deterministic
-offline fake, so the app, the CLI, and the entire test suite run with no network
-access and no cost. Keyword search uses SQLite's built-in FTS5, with a `LIKE`
-fallback if FTS5 is unavailable in your Python build.
+No API keys are needed. Both model-backed features default to deterministic
+offline fakes — embeddings for retrieval, and a rule-based extractor for
+conversation ingestion — so the app, the CLI, and the entire test suite run with
+no network access and no cost. Keyword search uses SQLite's built-in FTS5, with a
+`LIKE` fallback if FTS5 is unavailable in your Python build.
 
 ## Setup (Windows PowerShell)
 
@@ -185,6 +187,143 @@ embedded, `2` means embeddings are disabled.
 While a backfill is pending, semantic results are simply incomplete — `coverage`
 shows exactly how incomplete.
 
+## Conversation ingestion
+
+`POST /conversations` accepts a conversation, asks the configured model to
+extract durable facts, and stores them through the same memory service as
+everything else.
+
+```powershell
+$body = @{
+    user_id         = "user-a"
+    conversation_id = "conv-2026-10-26-001"
+    agent_id        = "support-bot"
+    messages        = @(
+        @{ role = "user";      content = "I'm vegetarian and I deploy on Fridays." },
+        @{ role = "assistant"; content = "Noted." }
+    )
+} | ConvertTo-Json -Depth 5
+
+Invoke-RestMethod -Method Post `
+    -Uri http://127.0.0.1:8000/conversations `
+    -ContentType "application/json" `
+    -Body $body
+```
+
+```json
+{
+  "conversation_id": "conv-2026-10-26-001",
+  "replayed": false,
+  "messages_received": 2,
+  "memories_created": [
+    { "id": "…", "user_id": "user-a", "agent_id": "support-bot",
+      "content": "I'm vegetarian", "kind": "fact", "...": "..." }
+  ],
+  "memories_skipped": [
+    { "content": "Deploys on Fridays", "kind": "event",
+      "reason": "duplicate_existing", "source_message_indexes": [0] }
+  ],
+  "extractor": { "provider": "fake", "model": "recallkit-rule-based-v1",
+                 "prompt_version": "extract-v1" }
+}
+```
+
+`source_message_indexes` are 0-based positions in the submitted conversation and
+are stored in `memory_sources`, so every extracted memory can be traced back to
+the message that produced it.
+
+### Idempotency
+
+`conversation_id` is client-supplied and scoped by `user_id`, so two users can use
+the same value independently. The request payload is hashed and stored with the
+receipt:
+
+| Request | Result |
+| --- | --- |
+| New `conversation_id` | `201 Created`, provider called once |
+| Same id, **identical** payload | `200 OK`, `replayed: true`, provider **not** called |
+| Same id, **different** payload | `409 Conflict`, nothing written, provider **not** called |
+
+A replay returns the stored receipt exactly as it was issued. If a memory has
+since been edited or deleted, the receipt still describes what that ingestion
+produced — it is a record, not a live view.
+
+### Duplicate detection
+
+Facts are compared using a documented canonical form:
+
+1. **Unicode** NFKC, so `ＤＡＲＫ` and `DARK` are the same text.
+2. **Case** folding, so `STRAßE` and `strasse` match.
+3. **Punctuation** replaced by spaces, so `"Dark mode!"` and `"dark mode"` match.
+4. **Whitespace** runs collapsed and trimmed, including tabs, newlines, and
+   non-breaking spaces.
+
+It deliberately does **not** remove diacritics (`café` and `cafe` stay distinct)
+and it does not understand meaning (`vegetarian` and `plant-based` are different).
+Known trade-offs: `C#` collides with `C` because `#` is punctuation, while `C++`
+does not; `don't` becomes `don t` and differs from `dont`.
+
+A duplicate is never stored. It is reported in `memories_skipped` with one of:
+
+| Reason | Meaning |
+| --- | --- |
+| `duplicate_existing` | Same canonical content already stored for this user |
+| `duplicate_in_request` | Repeated within the model's own output |
+| `low_confidence` | Below `RECALLKIT_MIN_FACT_CONFIDENCE` |
+| `too_long` | Longer than `RECALLKIT_MAX_FACT_CHARS` |
+| `invalid_fact` | Failed per-fact validation (wrong kind, blank, out of range) |
+| `limit_exceeded` | Beyond `RECALLKIT_MAX_FACTS_PER_CONVERSATION` |
+
+### Limits and failure behaviour
+
+| Situation | Response |
+| --- | --- |
+| More messages, or more characters, than configured | `422`, provider never called |
+| Extraction disabled (`RECALLKIT_LLM_PROVIDER=none`) and the conversation is new | `503` |
+| Provider error | `502` |
+| Output is not JSON, or not the expected top-level shape | `502`, nothing written |
+| One bad fact inside otherwise valid output | `201`, that fact reported as `invalid_fact` |
+
+A stored receipt can still be replayed with extraction disabled: replaying costs
+nothing and needs no provider. Only new conversations return `503`.
+
+The conversation receipt, its memories, and its provenance are committed in one
+transaction. A failure at any point leaves no partial conversation. Embeddings
+are generated after that commit, best effort: a memory is never rolled back
+because an embedding provider was unavailable, and search coverage shows the gap.
+
+### Raw message storage
+
+`RECALLKIT_STORE_MESSAGES` is `false` by default. When disabled, only extracted
+facts and message indexes are written; the conversation text is not persisted.
+Set it to `true` if you need the raw conversation for audit or re-extraction, and
+treat the database as sensitive.
+
+### Configuring the extractor
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `RECALLKIT_LLM_PROVIDER` | `fake` | `fake`, `openai_compatible`, or `none` |
+| `RECALLKIT_LLM_MODEL` | provider default | Recorded in every receipt |
+| `RECALLKIT_LLM_BASE_URL` | `https://api.openai.com/v1` | Any compatible endpoint |
+| `RECALLKIT_LLM_API_KEY` | — | Env only, never logged |
+| `RECALLKIT_MAX_MESSAGES_PER_CONVERSATION` | `50` | Request-size guard |
+| `RECALLKIT_MAX_MESSAGE_CHARS` | `8000` | Request-size guard |
+| `RECALLKIT_MAX_CONVERSATION_CHARS` | `40000` | Request-size guard |
+| `RECALLKIT_MAX_FACTS_PER_CONVERSATION` | `10` | Quality cap |
+| `RECALLKIT_MAX_FACT_CHARS` | `500` | Quality cap |
+| `RECALLKIT_MIN_FACT_CONFIDENCE` | `0.5` | Quality floor |
+
+The fake extractor is a **rule-based heuristic**, not a model: it keeps
+first-person sentences from user messages and labels them with a few cue words.
+It exists so the pipeline runs offline and so tests can pin exact behaviour.
+Real extraction quality requires `openai_compatible`.
+
+Conversation text is untrusted input. The prompt marks it as data and instructs
+the model to ignore instructions inside it, but the real protection is
+downstream: only a narrow typed schema can become a memory, and nothing extracted
+is ever executed.
+
 ## Try it
 
 PowerShell mangles JSON passed to `curl.exe` on the command line, so use
@@ -299,15 +438,18 @@ directory, so the development database is never touched. Coverage includes
 creation, retrieval, listing, filters, ordering, pagination, keyword search
 (both FTS5 and the LIKE fallback), search-input safety, update semantics,
 deletion, cross-user isolation, vector maths, embedding lifecycle, backfill,
-degradation, and database upgrades.
+degradation, database upgrades, conversation ingestion, extraction parsing,
+duplicate canonicalisation, idempotency replays and conflicts, provenance,
+request limits, provider failures, and transactional rollback.
 
 **The suite is offline by construction.** An autouse fixture in
 `tests/conftest.py` replaces `socket.create_connection` with a guard that fails
 the test, so any accidental outbound connection is caught rather than silently
-reaching a provider. `tests/test_offline.py` proves the guard is armed.
+reaching a provider. `tests/test_offline.py` proves the guard is armed and drives
+both retrieval and ingestion while it is.
 
-Deterministic tests use the fake provider. They verify plumbing and ordering,
-not semantic quality — see the fake-provider note above.
+Deterministic tests use the fake providers. They verify plumbing and ordering,
+not semantic or extraction quality — see the notes above.
 
 Lint and format checks:
 
@@ -329,22 +471,29 @@ recallkit/
 │   ├── api/
 │   │   ├── deps.py                # dependency wiring
 │   │   ├── memories.py            # /memories CRUD routes
-│   │   └── search.py              # POST /memories/search
+│   │   ├── search.py              # POST /memories/search
+│   │   └── conversations.py       # POST /conversations
 │   ├── repositories/
 │   │   ├── memories.py            # SQL for memories, incl. bm25 ranking
 │   │   ├── embeddings.py          # SQL for vectors
+│   │   ├── conversations.py       # receipts, provenance, optional messages
+│   │   ├── transactions.py        # BEGIN IMMEDIATE / rollback helper
 │   │   └── search.py              # safe FTS5 / LIKE query builders
 │   ├── retrieval/vectors.py       # float32 packing and cosine similarity
 │   ├── services/
 │   │   ├── memory_service.py      # IDs, timestamps, re-indexing rules
 │   │   ├── embedding_index.py     # best-effort vector maintenance
-│   │   └── search_service.py      # modes, fusion, coverage, degradation
+│   │   ├── search_service.py      # modes, fusion, coverage, degradation
+│   │   ├── canonical.py           # duplicate + payload canonicalisation
+│   │   ├── extraction.py          # prompt building and output parsing
+│   │   └── conversation_service.py# ingestion orchestration and atomic writes
 │   └── llm/
 │       ├── base.py                # LLMProvider + EmbeddingProvider Protocols
 │       ├── fake.py                # offline deterministic providers
-│       ├── openai_compatible.py   # /v1/embeddings over httpx
+│       ├── prompt_contract.py     # prompt marker shared with the fake
+│       ├── openai_compatible.py   # /v1/embeddings and /v1/chat/completions
 │       └── factory.py             # provider construction from settings
-├── schema.sql                     # memories, FTS5, embeddings, triggers
+├── schema.sql                     # memories, FTS5, embeddings, conversations
 ├── tests/                         # pytest suite (offline)
 ├── requirements.txt               # pinned runtime dependencies
 ├── requirements-dev.txt           # pinned test dependencies
@@ -370,6 +519,7 @@ The layers exist to keep each change small:
 | `GET` | `/memories` | List one page. Query: `user_id` (required), `agent_id`, `kind`, `q`, `limit`, `offset` |
 | `GET` | `/memories/{id}?user_id=...` | Read one memory owned by that user, else `404` |
 | `POST` | `/memories/search` | Ranked retrieval. Body: `user_id`, `query`, `mode`, optional `agent_id`, `kind`, `limit` |
+| `POST` | `/conversations` | Extract memories from messages. Body: `user_id`, `conversation_id`, `messages`, optional `agent_id` |
 | `PATCH` | `/memories/{id}?user_id=...` | Change `content` and/or `kind`, else `404` |
 | `DELETE` | `/memories/{id}?user_id=...` | Permanently delete; `204` on success, `404` otherwise |
 
@@ -413,15 +563,45 @@ edited by hand with the `sqlite3` shell. On startup a backfill statement
 indexes any rows the index is missing, which is what makes enabling search on
 an existing database safe.
 
-### How search stays safe
+Conversation ingestion adds three tables:
 
-User text is never concatenated into SQL. `app/repositories/search.py` splits
-the query into word tokens and builds the FTS5 expression by wrapping each
-token in double quotes and appending `*` for prefix matching, so characters
-such as `"`, `*`, `:`, `-`, `^` and `NEAR(` are treated as literal text rather
-than operators. The LIKE fallback escapes `\`, `%` and `_` and passes the
-pattern as a bound parameter with `ESCAPE '\'`. Every query still has
-`m.user_id = ?` in its `WHERE` clause.
+```sql
+CREATE TABLE conversations (
+    user_id          TEXT NOT NULL,
+    conversation_id  TEXT NOT NULL,
+    agent_id         TEXT,
+    message_count    INTEGER NOT NULL,
+    memories_created INTEGER NOT NULL,
+    memories_skipped INTEGER NOT NULL,
+    extractor        TEXT NOT NULL,
+    payload_hash     TEXT NOT NULL,   -- idempotency comparison
+    result_json      TEXT NOT NULL,   -- receipt returned on replay
+    created_at       TEXT NOT NULL,
+    PRIMARY KEY (user_id, conversation_id)
+);
+
+CREATE TABLE memory_sources (
+    memory_id       TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    user_id         TEXT NOT NULL,
+    conversation_id TEXT NOT NULL,
+    message_indexes TEXT NOT NULL,   -- JSON array of 0-based positions
+    created_at      TEXT NOT NULL,
+    PRIMARY KEY (memory_id, conversation_id)
+);
+
+CREATE TABLE conversation_messages (  -- only written when explicitly enabled
+    user_id         TEXT NOT NULL,
+    conversation_id TEXT NOT NULL,
+    position        INTEGER NOT NULL,
+    role            TEXT NOT NULL,
+    content         TEXT NOT NULL,
+    PRIMARY KEY (user_id, conversation_id, position)
+);
+```
+
+`(user_id, conversation_id)` is both the ownership key and the idempotency key.
+`result_json` duplicates memory content on purpose: it lets a replay return the
+original receipt without re-reading rows that may have changed since.
 
 ```sql
 CREATE TABLE memory_embeddings (
@@ -478,15 +658,29 @@ vector — still has `m.user_id = ?` in its `WHERE` clause.
   present, so it can overstate usable vectors if the table was damaged by hand.
 - **No auth.** `user_id` is caller-asserted. Do not expose this service beyond
   localhost until authentication exists.
-- **No conversation ingestion or fact extraction yet.** Memories are stored
-  exactly as the client sends them.
-- **One model at a time.** Vectors for a superseded model stay on disk; they are
-  ignored, not cleaned up.
+- **The fake extractor is a heuristic, not a model.** It keeps first-person
+  sentences and guesses a kind from cue words. It proves the pipeline, not
+  extraction quality.
+- **No semantic near-duplicate detection.** Duplicates are exact after
+  canonicalisation; paraphrases still produce separate memories. No conflict
+  supersession yet either, so a changed fact and its older version coexist.
+- **Stored facts can carry injection text.** A memory is plain text that a future
+  prompt may read. The ingestion path ignores instructions in the conversation,
+  but nothing sanitises what is stored.
+- **No auth.** `user_id` is caller-asserted. Do not expose this service beyond
+  localhost until authentication exists.
 - **Provider failures are logged, not surfaced per write.** A failed embed
   yields a normal `201`/`200`; the gap shows up as `coverage`.
+- **One model at a time.** Vectors for a superseded model stay on disk; they are
+  ignored, not cleaned up.
+- **Retention is manual.** Extracted memories live until deleted, and
+  `RECALLKIT_STORE_MESSAGES=true` makes raw conversations persistent.
+- **Corrupt vectors are invisible, not fatal.** A row whose stored dimensions
+  disagree with its blob is skipped and logged. `coverage.embedded` counts rows
+  present, so it can overstate usable vectors if the table was damaged by hand.
 
 ## Next milestone (not implemented)
 
-Conversation ingestion and fact extraction through the existing `LLMProvider`
-seam, then memory quality (deduplication and conflicting facts). Retrieval,
-including semantic and hybrid modes, is complete for now.
+Memory quality beyond exact duplicates: semantic near-duplicates, `subject`-based
+conflict supersession, and the migration runner that a canonical key column
+needs. Ingestion, extraction, and all retrieval modes are complete for now.
