@@ -112,6 +112,8 @@ def test_upgraded_database_enforces_foreign_keys(tmp_path: Path) -> None:
 def test_app_runs_against_an_upgraded_database(tmp_path: Path) -> None:
     path = tmp_path / "m2.db"
     _create_milestone_2_database(path)
+    # Explicit upgrade: startup never applies migrations.
+    Database(path).migrate()
     settings = Settings(_env_file=None, database_path=path)
 
     with TestClient(create_app(settings)) as client:
@@ -145,6 +147,8 @@ def test_app_runs_against_an_upgraded_database(tmp_path: Path) -> None:
 def test_delete_cascade_works_on_an_upgraded_database(tmp_path: Path) -> None:
     path = tmp_path / "m2.db"
     _create_milestone_2_database(path)
+    # Explicit upgrade: startup never applies migrations.
+    Database(path).migrate()
     settings = Settings(_env_file=None, database_path=path)
 
     with TestClient(create_app(settings)) as client:

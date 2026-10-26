@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
 from app.config import Settings
+from app.db import Database
 from app.llm.base import EmbeddingError, EmbeddingProvider
 from app.llm.factory import build_embedding_provider
 from app.llm.fake import DeterministicEmbeddingProvider
@@ -243,6 +244,8 @@ def test_startup_logs_the_model_but_not_the_key(tmp_path, caplog: pytest.LogCapt
         embedding_api_key=SecretStr(API_KEY),
         embedding_base_url="https://embeddings.test/v1",
     )
+    # Startup requires a current schema; tests prepare it explicitly.
+    Database(settings.database_path).initialize()
 
     with caplog.at_level(logging.INFO), TestClient(create_app(settings)):
         pass
