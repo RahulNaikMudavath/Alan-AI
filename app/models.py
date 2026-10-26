@@ -95,6 +95,73 @@ class MemoryList(BaseModel):
     offset: int
 
 
+SearchMode = Literal["keyword", "semantic", "hybrid"]
+MatchSource = Literal["keyword", "semantic"]
+
+# Query text is embedded as-is, so it may be a whole question rather than a few
+# keywords. The cap keeps a request from becoming an unbounded provider call.
+MAX_SEARCH_QUERY_LENGTH = 2000
+
+
+class MemorySearchRequest(BaseModel):
+    """Body of ``POST /memories/search``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    user_id: str = Field(min_length=1, max_length=128)
+    query: str = Field(min_length=1, max_length=MAX_SEARCH_QUERY_LENGTH)
+    mode: SearchMode = Field(
+        default="hybrid",
+        description=(
+            "keyword: FTS5 only. semantic: cosine similarity only. "
+            "hybrid: reciprocal rank fusion of both plus a recency signal."
+        ),
+    )
+    agent_id: str | None = Field(default=None, max_length=128)
+    kind: MemoryKind | None = None
+    limit: int = Field(default=10, ge=1, le=50)
+
+    @field_validator("user_id", "query", "agent_id")
+    @classmethod
+    def _must_not_be_blank(cls, value: str | None) -> str | None:
+        return _strip_non_blank(value)
+
+
+class MemorySearchResult(BaseModel):
+    """One ranked hit, with enough detail to explain why it matched."""
+
+    memory: Memory
+    score: float = Field(
+        description="Fused rank score. Relative within this response; not a probability."
+    )
+    similarity: float | None = Field(
+        default=None, description="Cosine similarity when a semantic signal matched."
+    )
+    matched_by: list[MatchSource] = Field(
+        description="Which signals found this memory. Recency only reorders."
+    )
+
+
+class EmbeddingCoverage(BaseModel):
+    """How much of the scoped memory set semantic search could actually see."""
+
+    embedded: int = Field(description="Memories with a vector for the active model.")
+    considered: int = Field(description="Memories matching the user and filters.")
+
+
+class MemorySearchResponse(BaseModel):
+    mode: SearchMode
+    query: str
+    degraded: bool = Field(
+        description=(
+            "True when semantic scoring was requested but unavailable, so results "
+            "come from keyword matching only."
+        )
+    )
+    coverage: EmbeddingCoverage
+    results: list[MemorySearchResult]
+
+
 class HealthResponse(BaseModel):
     """Result of the liveness probe."""
 
