@@ -40,6 +40,7 @@ from app.repositories.conversations import ConversationRecord, ConversationRepos
 from app.repositories.memories import MemoryRepository
 from app.repositories.transactions import transaction
 from app.services.canonical import canonical_content, payload_fingerprint
+from app.services.conflict_service import ConflictService
 from app.services.extraction import PROMPT_VERSION, build_prompt, parse_extraction
 from app.services.memory_service import MemoryService
 
@@ -72,6 +73,7 @@ class ConversationService:
         memory_service: MemoryService,
         provider: LLMProvider | None,
         settings: Settings,
+        conflicts: ConflictService | None = None,
     ) -> None:
         self._connection = connection
         self._conversations = conversations
@@ -79,6 +81,7 @@ class ConversationService:
         self._memory_service = memory_service
         self._provider = provider
         self._settings = settings
+        self._conflicts = conflicts
 
     def ingest(self, request: ConversationIngestRequest) -> tuple[ConversationIngestResponse, bool]:
         """Ingest one conversation. Returns ``(receipt, replayed)``."""
@@ -130,10 +133,13 @@ class ConversationService:
         with transaction(self._connection):
             # Read inside the write lock so concurrent ingestions cannot both
             # miss each other's memories.
-            existing_keys = {
-                canonical_content(content)
-                for content in self._memories.content_by_user(request.user_id)
-            }
+            existing_active: set[str] = set()
+            existing_superseded: set[str] = set()
+            for content, memory_status in self._memories.contents_by_status(request.user_id):
+                if memory_status == "active":
+                    existing_active.add(canonical_content(content))
+                else:
+                    existing_superseded.add(canonical_content(content))
             batch_keys: set[str] = set()
             created: list[tuple[Memory, list[int]]] = []
             skipped: list[SkippedMemory] = []
@@ -168,12 +174,22 @@ class ConversationService:
                         )
                     )
                     continue
-                if key in existing_keys:
+                if key in existing_active:
                     skipped.append(
                         SkippedMemory(
                             content=fact.content,
                             kind=fact.kind,
                             reason="duplicate_existing",
+                            source_message_indexes=indexes,
+                        )
+                    )
+                    continue
+                if key in existing_superseded:
+                    skipped.append(
+                        SkippedMemory(
+                            content=fact.content,
+                            kind=fact.kind,
+                            reason="duplicate_superseded",
                             source_message_indexes=indexes,
                         )
                     )
@@ -243,9 +259,12 @@ class ConversationService:
                     ]
                 )
 
-        # Committed. Embedding is derived data and may fail without affecting
-        # the memories that were just stored.
-        self._memory_service.index_many([memory for memory, _ in created])
+        # Committed. Embedding and conflict detection are derived data: both
+        # are best effort and neither can roll back a stored memory.
+        stored = [memory for memory, _ in created]
+        self._memory_service.index_many(stored)
+        if self._conflicts is not None:
+            self._conflicts.detect_for_many(stored)
         return response
 
     # -- decisions ---------------------------------------------------------

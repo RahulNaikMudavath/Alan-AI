@@ -5,16 +5,27 @@ generating IDs and timestamps today, calling an LLM to extract memories later.
 Routes stay thin and repositories stay unaware of these rules.
 """
 
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
-from app.models import Memory, MemoryCreate, MemoryKind, MemoryUpdate
+from app.models import (
+    Memory,
+    MemoryCreate,
+    MemoryKind,
+    MemoryUpdate,
+    SupersedeRequest,
+    SupersedeResponse,
+)
+from app.repositories.conflicts import ConflictRepository
 from app.repositories.memories import MemoryRepository
+from app.repositories.transactions import transaction
 from app.services.embedding_index import EmbeddingIndex
+from app.services.errors import MemoryNotFoundError, MemorySupersededError
+from app.services.supersession import supersede_locked
 
-
-class MemoryNotFoundError(LookupError):
-    """Raised when a memory does not exist for the requesting user."""
+# Re-exported for callers that import it from here (the HTTP layer does).
+__all__ = ["MemoryNotFoundError", "MemoryService"]
 
 
 def _next_timestamp(previous: datetime) -> str:
@@ -35,9 +46,14 @@ class MemoryService:
         self,
         repository: MemoryRepository,
         embeddings: EmbeddingIndex | None = None,
+        *,
+        conflicts: ConflictRepository | None = None,
+        connection: sqlite3.Connection | None = None,
     ) -> None:
         self._repository = repository
         self._embeddings = embeddings
+        self._conflicts = conflicts
+        self._connection = connection
 
     def remember(self, payload: MemoryCreate) -> Memory:
         """Store a new memory owned by ``payload.user_id``.
@@ -72,12 +88,14 @@ class MemoryService:
         user_id: str,
         agent_id: str | None = None,
         kind: str | None = None,
+        status: str = "active",
         query: str | None = None,
         limit: int = 20,
         offset: int = 0,
     ) -> tuple[list[Memory], int]:
         """Return one page of a user's memories and the total match count.
 
+        ``status`` is ``active`` (default), ``superseded``, or ``all``.
         A whitespace-only search is treated as no search at all, so
         ``?q=+++`` behaves like ``?q=`` instead of matching nothing.
         """
@@ -86,6 +104,7 @@ class MemoryService:
             user_id=user_id,
             agent_id=agent_id,
             kind=kind,
+            status=status,
             query=normalized or None,
             limit=limit,
             offset=offset,
@@ -99,6 +118,9 @@ class MemoryService:
         previous text; a kind-only change leaves the vector alone.
         """
         existing = self.get(memory_id, user_id=user_id)
+        if existing.status != "active":
+            raise MemorySupersededError(memory_id)
+
         content_changed = payload.content is not None and payload.content != existing.content
 
         if content_changed and self._embeddings is not None:
@@ -111,14 +133,46 @@ class MemoryService:
             content=payload.content,
             kind=payload.kind,
         )
-        # The row existed a moment ago and SQLite serialises writers, so this
-        # can only be None if it was deleted concurrently.
         if updated is None:
+            # Either deleted concurrently, or superseded between the check and
+            # the write (the UPDATE requires status = 'active').
+            current = self._repository.get(memory_id, user_id=user_id)
+            if current is not None:
+                raise MemorySupersededError(memory_id)
             raise MemoryNotFoundError(memory_id)
 
         if content_changed and self._embeddings is not None:
             self._embeddings.index(updated)
         return updated
+
+    def supersede(
+        self,
+        memory_id: str,
+        *,
+        user_id: str,
+        payload: SupersedeRequest,
+    ) -> SupersedeResponse:
+        """Explicitly retire one memory in favour of another.
+
+        Validation and the status change happen inside one transaction, so a
+        concurrent write cannot slip between them.
+        """
+        if self._conflicts is None or self._connection is None:
+            raise RuntimeError("supersession is not configured")
+
+        at = datetime.now(UTC).isoformat()
+        with transaction(self._connection):
+            outcome = supersede_locked(
+                memories=self._repository,
+                conflicts=self._conflicts,
+                user_id=user_id,
+                memory_id=memory_id,
+                superseded_by=payload.superseded_by,
+                reason=payload.reason,
+                note=payload.note,
+                at=at,
+            )
+        return SupersedeResponse(superseded=outcome.superseded, replacement=outcome.replacement)
 
     def delete(self, memory_id: str, *, user_id: str) -> None:
         """Delete a memory, or raise if it is not visible to ``user_id``."""
