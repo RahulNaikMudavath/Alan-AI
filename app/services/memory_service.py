@@ -8,7 +8,7 @@ Routes stay thin and repositories stay unaware of these rules.
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
-from app.models import Memory, MemoryCreate, MemoryUpdate
+from app.models import Memory, MemoryCreate, MemoryKind, MemoryUpdate
 from app.repositories.memories import MemoryRepository
 from app.services.embedding_index import EmbeddingIndex
 
@@ -124,3 +124,42 @@ class MemoryService:
         """Delete a memory, or raise if it is not visible to ``user_id``."""
         if not self._repository.delete(memory_id, user_id=user_id):
             raise MemoryNotFoundError(memory_id)
+
+    # -- batch helpers used by conversation ingestion ----------------------
+
+    def prepare(
+        self,
+        *,
+        user_id: str,
+        agent_id: str | None,
+        content: str,
+        kind: MemoryKind,
+        created_at: str | None = None,
+    ) -> Memory:
+        """Build a memory value without writing it.
+
+        Ingestion needs the ids and timestamps before the transaction (to build
+        the receipt), then writes all rows at once. Validation already happened
+        upstream, so this is pure construction.
+        """
+        stamp = created_at or datetime.now(UTC).isoformat()
+        return Memory(
+            id=uuid4().hex,
+            user_id=user_id,
+            agent_id=agent_id,
+            content=content,
+            kind=kind,
+            created_at=stamp,
+            updated_at=stamp,
+        )
+
+    def index_many(self, memories: list[Memory]) -> int:
+        """Embed memories that were just committed. Returns how many succeeded.
+
+        Called after the ingestion transaction, never inside it: an external
+        provider call must not hold a database write lock, and a failed embed
+        must not roll back committed memories.
+        """
+        if self._embeddings is None:
+            return 0
+        return sum(1 for memory in memories if self._embeddings.index(memory))
