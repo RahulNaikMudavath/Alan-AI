@@ -4,11 +4,12 @@ Persistent memory for AI agents. RecallKit is a small REST API that stores
 facts, preferences and events per user in SQLite and returns them on demand, so
 an agent can remember useful context between conversations.
 
-This repository currently contains **Milestone 3.2**: create, read, list,
+This repository currently contains **Milestone 3.3**: create, read, list,
 keyword search, update and delete, retrieval by meaning (semantic and hybrid),
-and conversation ingestion that extracts memories through a replaceable model
-provider. Every operation is scoped to one user. There is no authentication,
-conflict supersession, or frontend yet.
+conversation ingestion with fact extraction, and a memory lifecycle with
+explicit supersession, conflict candidates, and explainability. Every operation
+is scoped to one user. There is no authentication, SDK, dashboard, or frontend,
+and the service is not production-secure without authentication.
 
 ## Requirements
 
@@ -29,6 +30,8 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 python -m pip install -r requirements-dev.txt
+# create the database (required before the first run)
+.\.venv\Scripts\python.exe -m app.cli init
 ```
 
 If PowerShell refuses to run `Activate.ps1` because of the execution policy,
@@ -37,6 +40,7 @@ directly instead:
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+.\.venv\Scripts\python.exe -m app.cli init
 ```
 
 ## Run the API
@@ -54,10 +58,61 @@ curl.exe http://127.0.0.1:8000/health
 
 Expected response: `{"status":"ok","database":"ok"}`.
 
-The SQLite file is created automatically at `data/recallkit.db` on startup.
-Override the location by copying `.env.example` to `.env` and editing
-`RECALLKIT_DATABASE_PATH`, or by setting that environment variable directly.
-`.env` and everything under `data/` are git-ignored.
+Application startup **never creates or upgrades the database**. It verifies
+`PRAGMA user_version` and refuses to start when the schema is missing, behind,
+or newer than the build. The refusal names the path, the versions, and the
+command to run. That is deliberate: a schema change should never happen as a
+side effect of starting a web server.
+
+The SQLite file lives at `data/recallkit.db` by default. Override the location
+by copying `.env.example` to `.env` and editing `RECALLKIT_DATABASE_PATH`, or by
+setting that environment variable directly. `.env`, `data/`, and `backups/` are
+git-ignored.
+
+## Schema migrations
+
+```powershell
+# New database. Works with no schema present; refuses an existing one.
+.\.venv\Scripts\python.exe -m app.cli init
+
+# Existing database: inspect, back up, then apply.
+.\.venv\Scripts\python.exe -m app.cli migrate --check
+.\.venv\Scripts\python.exe -m app.cli migrate
+```
+
+`migrate --check` writes nothing; exit code `0` means current, `1` means pending
+or uninitialized. `migrate` ensures the baseline tables exist (old databases may
+lack tables added by later milestones) and then applies pending migrations, each
+inside one `BEGIN IMMEDIATE` transaction that also bumps `PRAGMA user_version`.
+A failure rolls the whole file back and leaves the version unchanged.
+
+### Back up before migrating
+
+Copying a live SQLite database is unsafe because WAL content may not be
+checkpointed. Stop the server first.
+
+```powershell
+# 1. stop the server (Ctrl+C in its terminal)
+# 2. copy the database and its WAL/SHM companions
+New-Item -ItemType Directory -Force .\backups | Out-Null
+Copy-Item .\data\recallkit.db, .\data\recallkit.db-wal, .\data\recallkit.db-shm `
+    .\backups\ -ErrorAction SilentlyContinue
+
+# 3. migrate
+.\.venv\Scripts\python.exe -m app.cli migrate
+
+# 4. start the server
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --reload
+```
+
+Restore with the server stopped:
+
+```powershell
+Copy-Item .\backups\recallkit.db* .\data\ -Force
+```
+
+Rolling the code back to an earlier milestone is safe: older inserts name their
+columns explicitly, and the lifecycle columns have defaults.
 
 ## Embedding providers
 
@@ -324,6 +379,108 @@ the model to ignore instructions inside it, but the real protection is
 downstream: only a narrow typed schema can become a memory, and nothing extracted
 is ever executed.
 
+## Memory lifecycle
+
+| Status | Searchable | Listed by default | Read by id | Editable | Deletable |
+| --- | --- | --- | --- | --- | --- |
+| `active` | yes | yes | yes | yes | yes |
+| `superseded` | no | no | yes | no (`409`) | yes |
+| deleted | no | no | no | — | already gone |
+
+Deleting is still a hard delete. Superseded memories are history: retained,
+readable, and excluded from retrieval.
+
+```powershell
+# Supersede an old memory in favour of a newer one
+$supersede = @{
+    superseded_by = $new.id
+    reason        = "user_correction"   # user_correction | outdated | contradiction | duplicate | other
+    note          = "User changed their preference"
+} | ConvertTo-Json
+Invoke-RestMethod -Method Post `
+    -Uri "http://127.0.0.1:8000/memories/$($old.id)/supersede?user_id=user-a" `
+    -ContentType "application/json" `
+    -Body $supersede
+
+# History is browsable without polluting normal lists
+Invoke-RestMethod "http://127.0.0.1:8000/memories?user_id=user-a&status=superseded"
+Invoke-RestMethod "http://127.0.0.1:8000/memories?user_id=user-a&status=all"
+```
+
+`POST /memories/search` always returns active memories only. `PATCH` on a
+superseded memory returns `409`; the record is history and should not be edited.
+Deleting a memory that was used as a replacement clears the pointer
+(`superseded_by: null`) but keeps the timestamp and reason.
+
+## Conflicts are candidates, not verdicts
+
+RecallKit detects **one narrow pattern**: two active memories with heavily
+overlapping words where exactly one side contains an explicit negation.
+
+- Detected: "I like coffee" vs "I do not like coffee".
+- Not detected (false negatives): "prefers dark mode" vs "prefers light mode",
+  "is vegetarian" vs "eats meat".
+- Possible false positive: "I never drink coffee at night" vs "I drink coffee" —
+  both can be true in different contexts.
+
+Detection writes a candidate row with its evidence and **never changes a memory's
+status**. Nothing is auto-resolved, and no confidence score is invented; the
+recorded `token_containment` is a lexical observation, not a probability.
+
+```powershell
+# See candidates
+Invoke-RestMethod "http://127.0.0.1:8000/memory-conflicts?user_id=user-a&status=open"
+
+# Resolve explicitly: keep_a, keep_b, or keep_both
+$resolution = @{ user_id = "user-a"; resolution = "keep_b"; note = "Newer wording wins" } | ConvertTo-Json
+Invoke-RestMethod -Method Post `
+    -Uri "http://127.0.0.1:8000/memory-conflicts/$($conflict.id)/resolve" `
+    -ContentType "application/json" `
+    -Body $resolution
+```
+
+`keep_a` / `keep_b` supersede the losing memory with reason `contradiction` in
+the same transaction. `keep_both` closes the candidate and leaves both active.
+Resolving twice returns `409`. For a correction the detector cannot see, use
+`POST /memories/{id}/supersede` directly — that is the only way a memory becomes
+superseded.
+
+A scan re-runs detection over existing memories and is safe to repeat:
+
+```powershell
+Invoke-RestMethod -Method Post "http://127.0.0.1:8000/memory-conflicts/scan?user_id=user-a"
+```
+
+## Explain a memory
+
+```powershell
+Invoke-RestMethod "http://127.0.0.1:8000/memories/$($created.id)/explain?user_id=user-a"
+```
+
+```json
+{
+  "memory": { "id": "…", "status": "active", "...": "..." },
+  "observed": {
+    "origin": "conversation",
+    "sources": [{ "conversation_id": "conv-…", "message_indexes": [0],
+                  "extractor": { "provider": "fake", "model": "…", "prompt_version": "extract-v1" } }],
+    "indexes": { "keyword": true, "embedding_models": ["recallkit-fake-hash-v1-256"] },
+    "lifecycle": { "status": "active", "superseded_at": null, "superseded_by": null,
+                   "reason": null, "note": null }
+  },
+  "inferred": {
+    "conflict_candidates": [{ "conflict_id": "…", "other_memory_id": "…",
+                              "rule": "explicit_negation",
+                              "evidence": { "shared_terms": ["coffee", "like"], "...": "..." },
+                              "status": "open" }]
+  }
+}
+```
+
+`observed` is read from stored rows. `inferred` is the lexical heuristic. Raw
+conversation messages are never returned here, even when
+`RECALLKIT_STORE_MESSAGES=true`; only their indexes are exposed.
+
 ## Try it
 
 PowerShell mangles JSON passed to `curl.exe` on the command line, so use
@@ -425,7 +582,33 @@ Invoke-RestMethod -Method Delete `
 
 Deletion is permanent and returns `204 No Content`. Deleting the same memory
 again returns `404`. Deleting or changing another user's memory also returns
-`404`, and leaves their data untouched.
+`404`, and leaves their data untouched. Deleting a memory cascades to its
+embeddings, provenance rows, and conflict candidates.
+
+## Deletion and privacy
+
+`DELETE /memories/{id}` removes the memory row. Foreign keys cascade to
+`memory_embeddings`, `memory_sources`, and `memory_conflicts`, so those derived
+rows disappear with it. Deleting a memory used as a replacement clears
+`superseded_by` on the superseded row.
+
+**It is not complete erasure.** Deleting a memory does **not** erase its content
+from:
+
+- `conversations.result_json`, the stored receipt for the ingestion that
+  produced it, which still contains a snapshot of the memory;
+- `conversation_messages`, when `RECALLKIT_STORE_MESSAGES=true` has stored the
+  raw conversation.
+
+Those rows are deliberately retained so idempotent replay keeps working and so
+provenance remains auditable. Conversation-level deletion and a retention policy
+are **future work**; there is no endpoint that removes a conversation or its
+messages. If you enable raw message storage, treat the database as containing
+sensitive conversation data and manage retention outside RecallKit for now.
+
+Superseded memories remain on disk until explicitly deleted. They are excluded
+from search but are not a privacy boundary; delete them if they should not be
+kept.
 
 ## Tests
 
@@ -440,7 +623,9 @@ creation, retrieval, listing, filters, ordering, pagination, keyword search
 deletion, cross-user isolation, vector maths, embedding lifecycle, backfill,
 degradation, database upgrades, conversation ingestion, extraction parsing,
 duplicate canonicalisation, idempotency replays and conflicts, provenance,
-request limits, provider failures, and transactional rollback.
+request limits, provider failures, transactional rollback, schema migrations,
+lifecycle and supersession, conflict detection and resolution, explainability,
+search filtering of history, deletion cascades, and receipt-retention behaviour.
 
 **The suite is offline by construction.** An autouse fixture in
 `tests/conftest.py` replaces `socket.create_connection` with a guard that fails
@@ -516,14 +701,20 @@ The layers exist to keep each change small:
 | --- | --- | --- |
 | `GET` | `/health` | `{"status":"ok","database":"ok"}`, or `503` if storage is broken |
 | `POST` | `/memories` | Store a memory. Body: `user_id`, `content`, optional `agent_id`, optional `kind` |
-| `GET` | `/memories` | List one page. Query: `user_id` (required), `agent_id`, `kind`, `q`, `limit`, `offset` |
-| `GET` | `/memories/{id}?user_id=...` | Read one memory owned by that user, else `404` |
-| `POST` | `/memories/search` | Ranked retrieval. Body: `user_id`, `query`, `mode`, optional `agent_id`, `kind`, `limit` |
+| `GET` | `/memories` | List one page. Query: `user_id`, `agent_id`, `kind`, `status`, `q`, `limit`, `offset` |
+| `GET` | `/memories/{id}?user_id=...` | Read one memory (active or superseded), else `404` |
+| `GET` | `/memories/{id}/explain?user_id=...` | Observed provenance and indexes, plus inferred candidates |
+| `POST` | `/memories/{id}/supersede?user_id=...` | Explicitly retire a memory in favour of another |
+| `POST` | `/memories/search` | Ranked retrieval over active memories. Body: `user_id`, `query`, `mode`, filters |
 | `POST` | `/conversations` | Extract memories from messages. Body: `user_id`, `conversation_id`, `messages`, optional `agent_id` |
-| `PATCH` | `/memories/{id}?user_id=...` | Change `content` and/or `kind`, else `404` |
+| `GET` | `/memory-conflicts` | List conflict candidates. Query: `user_id`, `status`, `limit`, `offset` |
+| `POST` | `/memory-conflicts/{id}/resolve` | Resolve with `keep_a`, `keep_b`, or `keep_both` |
+| `POST` | `/memory-conflicts/scan?user_id=...` | Re-scan existing memories; idempotent |
+| `PATCH` | `/memories/{id}?user_id=...` | Change `content` and/or `kind`; `409` if superseded |
 | `DELETE` | `/memories/{id}?user_id=...` | Permanently delete; `204` on success, `404` otherwise |
 
 `kind` is one of `fact`, `preference`, `event`, `task` (default `fact`).
+`status` is `active` (default), `superseded`, or `all`.
 
 ### Why `user_id` is a query parameter
 
@@ -545,6 +736,40 @@ CREATE TABLE memories (
     updated_at TEXT NOT NULL
 );
 ```
+
+Milestone 3.3 adds lifecycle columns through a migration, not by editing the
+baseline:
+
+```sql
+ALTER TABLE memories ADD COLUMN status TEXT NOT NULL DEFAULT 'active'
+    CHECK (status IN ('active', 'superseded'));
+ALTER TABLE memories ADD COLUMN superseded_at TEXT;
+ALTER TABLE memories ADD COLUMN superseded_by TEXT
+    REFERENCES memories(id) ON DELETE SET NULL;
+ALTER TABLE memories ADD COLUMN superseded_reason TEXT;
+ALTER TABLE memories ADD COLUMN superseded_note TEXT;
+
+CREATE TABLE memory_conflicts (
+    id          TEXT PRIMARY KEY,
+    user_id     TEXT NOT NULL,
+    memory_a    TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    memory_b    TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    status      TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'resolved')),
+    rule        TEXT NOT NULL,
+    evidence    TEXT NOT NULL,
+    resolution  TEXT CHECK (resolution IS NULL OR resolution IN
+                    ('kept_a', 'kept_b', 'kept_both', 'superseded')),
+    detected_at TEXT NOT NULL,
+    resolved_at TEXT,
+    CHECK (memory_a < memory_b),
+    UNIQUE (user_id, memory_a, memory_b)
+);
+```
+
+`superseded_by` uses `ON DELETE SET NULL`, so deleting the replacement does not
+block deleting the old row. `memory_conflicts` cascades when either memory is
+deleted. `status = 'active'` is applied to every retrieval path, and superseded
+rows stay in the FTS5 index but are filtered out at query time.
 
 Search uses a standalone FTS5 table plus three triggers:
 
