@@ -10,6 +10,7 @@ from uuid import uuid4
 
 from app.models import Memory, MemoryCreate, MemoryUpdate
 from app.repositories.memories import MemoryRepository
+from app.services.embedding_index import EmbeddingIndex
 
 
 class MemoryNotFoundError(LookupError):
@@ -30,13 +31,22 @@ def _next_timestamp(previous: datetime) -> str:
 
 
 class MemoryService:
-    def __init__(self, repository: MemoryRepository) -> None:
+    def __init__(
+        self,
+        repository: MemoryRepository,
+        embeddings: EmbeddingIndex | None = None,
+    ) -> None:
         self._repository = repository
+        self._embeddings = embeddings
 
     def remember(self, payload: MemoryCreate) -> Memory:
-        """Store a new memory owned by ``payload.user_id``."""
+        """Store a new memory owned by ``payload.user_id``.
+
+        The write happens first and is never rolled back because vector
+        indexing failed.
+        """
         now = datetime.now(UTC).isoformat()
-        return self._repository.add(
+        memory = self._repository.add(
             memory_id=uuid4().hex,
             user_id=payload.user_id,
             agent_id=payload.agent_id,
@@ -45,6 +55,9 @@ class MemoryService:
             created_at=now,
             updated_at=now,
         )
+        if self._embeddings is not None:
+            self._embeddings.index(memory)
+        return memory
 
     def get(self, memory_id: str, *, user_id: str) -> Memory:
         """Fetch one memory, or raise if it is not visible to ``user_id``."""
@@ -79,8 +92,18 @@ class MemoryService:
         )
 
     def update(self, memory_id: str, *, user_id: str, payload: MemoryUpdate) -> Memory:
-        """Apply a partial update, or raise if the memory is not visible."""
+        """Apply a partial update, or raise if the memory is not visible.
+
+        A content change invalidates the stored vector. It is removed *before*
+        re-indexing so a provider failure cannot leave a vector describing the
+        previous text; a kind-only change leaves the vector alone.
+        """
         existing = self.get(memory_id, user_id=user_id)
+        content_changed = payload.content is not None and payload.content != existing.content
+
+        if content_changed and self._embeddings is not None:
+            self._embeddings.discard(memory_id)
+
         updated = self._repository.update(
             memory_id,
             user_id=user_id,
@@ -92,6 +115,9 @@ class MemoryService:
         # can only be None if it was deleted concurrently.
         if updated is None:
             raise MemoryNotFoundError(memory_id)
+
+        if content_changed and self._embeddings is not None:
+            self._embeddings.index(updated)
         return updated
 
     def delete(self, memory_id: str, *, user_id: str) -> None:
