@@ -17,6 +17,7 @@ bound parameters.
 """
 
 import re
+from collections.abc import Sequence
 
 # Split on anything that is not a word character. This drops every FTS5
 # operator character and gives the LIKE fallback the same notion of a "word"
@@ -66,3 +67,16 @@ def build_like_patterns(query: str) -> list[str]:
         literal = query.strip()
         tokens = [literal] if literal else []
     return [f"%{_escape_like(token)}%" for token in tokens]
+
+
+def build_fts_any_expression(tokens: Sequence[str]) -> str | None:
+    """Build an OR-ed FTS5 expression from already-tokenised words.
+
+    Used only by conflict candidate generation, where requiring every word
+    (the normal AND behaviour) would be too strict. Every token is quoted, so
+    operators cannot be injected.
+    """
+    cleaned = [token.replace('"', '""') for token in tokens if token]
+    if not cleaned:
+        return None
+    return " OR ".join(f'"{token}"*' for token in cleaned)

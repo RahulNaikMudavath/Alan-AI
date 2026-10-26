@@ -122,6 +122,21 @@ class ConversationRepository:
             rows,
         )
 
+    def sources_for_memory(self, *, memory_id: str, user_id: str) -> list[sqlite3.Row]:
+        """Return provenance joined with its conversation metadata."""
+        return self._connection.execute(
+            """
+            SELECT s.conversation_id, s.message_indexes,
+                   c.created_at AS conversation_created_at, c.extractor
+            FROM memory_sources s
+            JOIN conversations c
+              ON c.user_id = s.user_id AND c.conversation_id = s.conversation_id
+            WHERE s.memory_id = ? AND s.user_id = ?
+            ORDER BY c.created_at DESC, s.conversation_id
+            """,
+            (memory_id, user_id),
+        ).fetchall()
+
     def source_indexes(self, memory_id: str) -> list[int] | None:
         """Return stored provenance indexes for one memory, if any."""
         row = self._connection.execute(

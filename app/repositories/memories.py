@@ -6,9 +6,14 @@ every read is scoped by ``user_id``.
 """
 
 import sqlite3
+from collections.abc import Sequence
 
 from app.models import Memory
-from app.repositories.search import build_fts_expression, build_like_patterns
+from app.repositories.search import (
+    build_fts_any_expression,
+    build_fts_expression,
+    build_like_patterns,
+)
 
 _COLUMNS = (
     "m.id, m.user_id, m.agent_id, m.content, m.kind, m.created_at, m.updated_at, "
@@ -81,6 +86,20 @@ class MemoryRepository:
             ],
         )
 
+    def content_by_user(self, user_id: str) -> list[str]:
+        """Return every stored content string for a user.
+
+        Duplicate detection canonicalises these in Python: SQLite's ``lower()``
+        is ASCII-only and cannot strip punctuation or normalise Unicode. The
+        cost is linear in a user's memory count, which is acceptable at this
+        scale and revisited when a canonical key column is added.
+        """
+        rows = self._connection.execute(
+            "SELECT content FROM memories WHERE user_id = ?",
+            (user_id,),
+        ).fetchall()
+        return [row["content"] for row in rows]
+
     def contents_by_status(self, user_id: str) -> list[tuple[str, str]]:
         """Return ``(content, status)`` for every memory the user owns.
 
@@ -113,18 +132,35 @@ class MemoryRepository:
         ).fetchone()
         return Memory(**dict(row)) if row is not None else None
 
+    def get_many(self, *, user_id: str, memory_ids: Sequence[str]) -> dict[str, Memory]:
+        """Return the requested memories owned by ``user_id``, keyed by id."""
+        if not memory_ids:
+            return {}
+        placeholders = ",".join("?" for _ in memory_ids)
+        rows = self._connection.execute(
+            f"""
+            SELECT id, user_id, agent_id, content, kind, created_at, updated_at,
+                   status, superseded_at, superseded_by, superseded_reason, superseded_note
+            FROM memories
+            WHERE user_id = ? AND id IN ({placeholders})
+            """,
+            [user_id, *memory_ids],
+        ).fetchall()
+        return {row["id"]: Memory(**dict(row)) for row in rows}
+
     def list(
         self,
         *,
         user_id: str,
         agent_id: str | None = None,
         kind: str | None = None,
+        status: str = "active",
         query: str | None = None,
         limit: int,
         offset: int,
     ) -> tuple[list[Memory], int]:
         """Return one page of a user's memories and the total match count."""
-        filters, params = self._filters(user_id, agent_id, kind)
+        filters, params = self._filters(user_id, agent_id, kind, status)
 
         if query:
             rows, total = self._search(filters, params, query, limit, offset)
@@ -155,7 +191,8 @@ class MemoryRepository:
 
         with self._connection:
             cursor = self._connection.execute(
-                f"UPDATE memories SET {', '.join(assignments)} WHERE id = ? AND user_id = ?",
+                f"UPDATE memories SET {', '.join(assignments)} "
+                "WHERE id = ? AND user_id = ? AND status = 'active'",
                 params,
             )
         if cursor.rowcount == 0:
@@ -177,9 +214,10 @@ class MemoryRepository:
         user_id: str,
         agent_id: str | None = None,
         kind: str | None = None,
+        status: str = "active",
     ) -> int:
         """Count the user's memories after filters, ignoring paging and search."""
-        filters, params = self._filters(user_id, agent_id, kind)
+        filters, params = self._filters(user_id, agent_id, kind, status)
         return self._connection.execute(
             f"SELECT COUNT(*) FROM memories m WHERE {' AND '.join(filters)}",
             params,
@@ -194,7 +232,7 @@ class MemoryRepository:
         limit: int,
     ) -> list[str]:
         """Return ids newest first. Feeds the recency signal of hybrid ranking."""
-        filters, params = self._filters(user_id, agent_id, kind)
+        filters, params = self._filters(user_id, agent_id, kind, "active")
         rows = self._connection.execute(
             f"SELECT m.id FROM memories m WHERE {' AND '.join(filters)} {_ORDER} LIMIT ?",
             [*params, limit],
@@ -216,7 +254,7 @@ class MemoryRepository:
         ordering is part of the existing ``GET /memories`` contract. Relevance
         ordering is only used by ``POST /memories/search``.
         """
-        filters, params = self._filters(user_id, agent_id, kind)
+        filters, params = self._filters(user_id, agent_id, kind, "active")
         expression = build_fts_expression(query)
         if expression is not None:
             try:
@@ -253,15 +291,77 @@ class MemoryRepository:
         ).fetchall()
         return [Memory(**dict(row)) for row in rows]
 
+    def search_any(
+        self,
+        *,
+        user_id: str,
+        tokens: Sequence[str],
+        exclude_id: str | None = None,
+        limit: int,
+    ) -> list[Memory]:
+        """Active memories matching *any* token, best match first.
+
+        Only conflict candidate generation uses this: requiring every word
+        (normal search behaviour) would be too strict for finding related
+        facts. Never exposed through the public search endpoint.
+        """
+        filters, params = self._filters(user_id, None, None, "active")
+        if exclude_id is not None:
+            filters.append("m.id != ?")
+            params.append(exclude_id)
+
+        expression = build_fts_any_expression(tokens)
+        if expression is not None:
+            try:
+                rows = self._connection.execute(
+                    f"""
+                    SELECT {_COLUMNS}
+                    FROM memories m
+                    JOIN memories_fts ON memories_fts.memory_id = m.id
+                    WHERE {" AND ".join([*filters, "memories_fts MATCH ?"])}
+                    ORDER BY bm25(memories_fts) ASC, m.created_at DESC, m.id DESC
+                    LIMIT ?
+                    """,
+                    [*params, expression, limit],
+                ).fetchall()
+                return [Memory(**dict(row)) for row in rows]
+            except sqlite3.OperationalError:
+                pass
+
+        patterns = build_like_patterns(" ".join(tokens))
+        if not patterns:
+            return []
+        like_filters = [
+            *filters,
+            "(" + " OR ".join(r"m.content LIKE ? ESCAPE '\'" for _ in patterns) + ")",
+        ]
+        rows = self._connection.execute(
+            f"""
+            SELECT {_COLUMNS}
+            FROM memories m
+            WHERE {" AND ".join(like_filters)}
+            {_ORDER}
+            LIMIT ?
+            """,
+            [*params, *patterns, limit],
+        ).fetchall()
+        return [Memory(**dict(row)) for row in rows]
+
     # -- internals ---------------------------------------------------------
 
     @staticmethod
     def _filters(
-        user_id: str, agent_id: str | None, kind: str | None
+        user_id: str,
+        agent_id: str | None,
+        kind: str | None,
+        status: str = "active",
     ) -> tuple[list[str], list[object]]:
         """Build the WHERE fragments that always apply, plus their parameters."""
         filters = ["m.user_id = ?"]
         params: list[object] = [user_id]
+        if status != "all":
+            filters.append("m.status = ?")
+            params.append(status)
         if agent_id is not None:
             filters.append("m.agent_id = ?")
             params.append(agent_id)
@@ -269,6 +369,46 @@ class MemoryRepository:
             filters.append("m.kind = ?")
             params.append(kind)
         return filters, params
+
+    def supersede(
+        self,
+        memory_id: str,
+        *,
+        user_id: str,
+        superseded_by: str,
+        reason: str,
+        note: str | None,
+        at: str,
+    ) -> Memory | None:
+        """Mark a memory superseded, only if it is still active.
+
+        The ``status = 'active'`` predicate makes concurrent supersessions safe:
+        exactly one caller can win. Returns None when the row changed.
+        """
+        with self._connection:
+            cursor = self._connection.execute(
+                """
+                UPDATE memories
+                SET status = 'superseded', superseded_at = ?, superseded_by = ?,
+                    superseded_reason = ?, superseded_note = ?
+                WHERE id = ? AND user_id = ? AND status = 'active'
+                """,
+                (at, superseded_by, reason, note, memory_id, user_id),
+            )
+        if cursor.rowcount == 0:
+            return None
+        return self.get(memory_id, user_id=user_id)
+
+    def is_keyword_indexed(self, memory_id: str) -> bool:
+        """Whether an FTS row exists for this memory (observed fact, no score)."""
+        try:
+            row = self._connection.execute(
+                "SELECT 1 FROM memories_fts WHERE memory_id = ? LIMIT 1",
+                (memory_id,),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            return False
+        return row is not None
 
     def _page(
         self,

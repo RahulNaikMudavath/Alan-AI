@@ -92,6 +92,14 @@ class EmbeddingRepository:
             cursor = self._connection.execute(sql, params)
         return cursor.rowcount
 
+    def models_for_memory(self, memory_id: str) -> list[str]:
+        """Return every embedding model stored for a memory (observed facts)."""
+        rows = self._connection.execute(
+            "SELECT model FROM memory_embeddings WHERE memory_id = ? ORDER BY model",
+            (memory_id,),
+        ).fetchall()
+        return [row["model"] for row in rows]
+
     def get(self, memory_id: str, *, model: str) -> tuple[int, bytes] | None:
         """Return ``(dimensions, vector_blob)`` for one memory and model."""
         row = self._connection.execute(
@@ -171,6 +179,7 @@ class EmbeddingRepository:
         """
         filters = [
             "m.rowid > ?",
+            "m.status = 'active'",
             "NOT EXISTS (SELECT 1 FROM memory_embeddings e "
             "WHERE e.memory_id = m.id AND e.model = ?)",
         ]
@@ -197,7 +206,7 @@ class EmbeddingRepository:
     def _filters(
         user_id: str, model: str, agent_id: str | None, kind: str | None
     ) -> tuple[list[str], list[object]]:
-        filters = ["m.user_id = ?", "e.model = ?"]
+        filters = ["m.user_id = ?", "e.model = ?", "m.status = 'active'"]
         params: list[object] = [user_id, model]
         if agent_id is not None:
             filters.append("m.agent_id = ?")
