@@ -4,18 +4,20 @@ Persistent memory for AI agents. RecallKit is a small REST API that stores
 facts, preferences and events per user in SQLite and returns them on demand, so
 an agent can remember useful context between conversations.
 
-This repository currently contains **Milestone 2**: full create, read, list,
-keyword search, update and delete over SQLite, with every operation scoped to
-one user. There is no authentication, semantic search, or LLM integration yet.
+This repository currently contains **Milestone 3.1**: create, read, list,
+keyword search, update and delete, plus vector embeddings and retrieval by
+meaning (semantic and hybrid). Every operation is scoped to one user. There is
+no authentication, conversation ingestion, or automatic fact extraction yet.
 
 ## Requirements
 
 - Python 3.11 or newer (developed and tested on Python 3.14)
 - Windows PowerShell (commands below), or the equivalent on macOS/Linux
 
-No API keys are needed. Nothing in this milestone calls an external service.
-Search is implemented with SQLite's built-in FTS5, with a `LIKE` fallback if
-FTS5 is unavailable in your Python build.
+No API keys are needed. The default embedding provider is a deterministic
+offline fake, so the app, the CLI, and the entire test suite run with no network
+access and no cost. Keyword search uses SQLite's built-in FTS5, with a `LIKE`
+fallback if FTS5 is unavailable in your Python build.
 
 ## Setup (Windows PowerShell)
 
@@ -54,6 +56,134 @@ The SQLite file is created automatically at `data/recallkit.db` on startup.
 Override the location by copying `.env.example` to `.env` and editing
 `RECALLKIT_DATABASE_PATH`, or by setting that environment variable directly.
 `.env` and everything under `data/` are git-ignored.
+
+## Embedding providers
+
+Semantic search needs vectors, so creating or editing a memory also embeds it.
+Choose the provider with `RECALLKIT_EMBEDDING_PROVIDER`:
+
+| Value | What it does | Cost | Use it for |
+| --- | --- | --- | --- |
+| `fake` (default) | Hashes words into a fixed-size vector | Free, offline | Development, tests, demos |
+| `openai_compatible` | Calls any `POST /v1/embeddings` endpoint | Provider's price per token | Real retrieval quality |
+| `none` | No vectors; semantic search reports `degraded` | Free | Keyword-only deployments |
+
+```powershell
+# Real embeddings. The key comes from the environment, never from source.
+$env:RECALLKIT_EMBEDDING_PROVIDER = "openai_compatible"
+$env:RECALLKIT_EMBEDDING_API_KEY  = "<your key>"
+$env:RECALLKIT_EMBEDDING_BASE_URL = "https://api.openai.com/v1"
+$env:RECALLKIT_EMBEDDING_MODEL    = "text-embedding-3-small"
+$env:RECALLKIT_EMBEDDING_DIMENSIONS = "1536"
+```
+
+Any compatible endpoint works: Azure OpenAI, a local Ollama or vLLM server, or
+an internal gateway. Only `base_url`, `model`, and `dimensions` change. If the
+provider is set to `openai_compatible` without a key, startup fails with a
+message naming the missing variable.
+
+The key is read into a `SecretStr`, sent only as an `Authorization` header, and
+never logged or included in an exception message. Put it in `.env` (git-ignored)
+or your shell environment. Never commit it.
+
+### What the fake provider does and does not do
+
+The fake is a **bag-of-words hasher**. It scores shared words (and adjacent word
+pairs), so `"dark mode"` is close to `"prefers dark mode"`. It has no notion of
+synonyms: `"diet"` is not close to `"vegetarian"`.
+
+That is deliberate. It makes the plumbing deterministic and free to test:
+ranking, fusion, isolation, coverage, and degradation are all verified exactly.
+It proves **no semantic understanding**, and this project does not claim any.
+Real retrieval quality requires a real embedding model; the limits section
+below explains how little the fake can be trusted for that.
+
+## Semantic and hybrid retrieval
+
+`POST /memories/search` is the relevance-ranked endpoint. `GET /memories?q=`
+is unchanged and remains newest-first.
+
+```powershell
+$search = @{
+    user_id = "user-a"
+    query   = "what does this person eat?"
+    mode    = "hybrid"      # keyword | semantic | hybrid
+    limit   = 5
+} | ConvertTo-Json
+
+Invoke-RestMethod -Method Post `
+    -Uri http://127.0.0.1:8000/memories/search `
+    -ContentType "application/json" `
+    -Body $search
+```
+
+```json
+{
+  "mode": "hybrid",
+  "query": "what does this person eat?",
+  "degraded": false,
+  "coverage": { "embedded": 12, "considered": 13 },
+  "results": [
+    {
+      "memory": { "id": "...", "content": "Is vegetarian", "kind": "fact", "...": "..." },
+      "score": 0.0325,
+      "similarity": 0.71,
+      "matched_by": ["keyword", "semantic"]
+    }
+  ]
+}
+```
+
+How to read the response:
+
+- **`matched_by`** says which signals found the memory: FTS5 keywords, cosine
+  similarity, or both.
+- **`similarity`** is the raw cosine score when the semantic signal matched, in
+  `[-1, 1]`. `null` means the memory was never compared as a vector.
+- **`score`** is a fused rank score, **relative within this response only**. It
+  is not a probability and is not comparable between requests.
+- **`degraded: true`** means semantic scoring was requested but unavailable
+  (no provider, or the provider failed), so results come from keyword matching
+  only. The app never silently pretends otherwise.
+- **`coverage`** reports how many of the user's scoped memories have a vector
+  for the active model versus how many exist. It is the honest measure of what
+  semantic search could see.
+
+Modes:
+
+| Mode | Behaviour |
+| --- | --- |
+| `keyword` | FTS5 only, ordered by bm25 relevance. Prefix matching still applies. |
+| `semantic` | Cosine similarity only, above `RECALLKIT_SEMANTIC_MIN_SIMILARITY`. |
+| `hybrid` (default) | Reciprocal Rank Fusion of both lists, plus a recency signal. |
+
+**Why rank fusion.** A cosine similarity is bounded and positive-ish; bm25 is
+unbounded and negative. Adding them requires inventing calibration constants.
+Reciprocal Rank Fusion uses only positions — `weight / (60 + rank)` per list —
+so it needs no training and no tuning to behave sanely. Recency can only
+reorder memories that a real signal already matched; it never invents a hit.
+
+Every mode applies `user_id`, `agent_id`, and `kind` in the SQL `WHERE` clause,
+so a filter cannot be bypassed by switching modes.
+
+### Backfilling existing memories
+
+Memories written before this milestone have no vectors. Index them with the
+CLI, which is safe to rerun:
+
+```powershell
+.\.venv\Scripts\python.exe -m app.cli backfill-embeddings
+.\.venv\Scripts\python.exe -m app.cli backfill-embeddings --user-id user-a --batch-size 25
+```
+
+It only adds vectors for the configured model where none exist. It never
+overwrites an existing vector and never touches vectors belonging to a
+different model, so switching models later cannot corrupt the old data. Exit
+code `0` means nothing failed, `1` means at least one memory could not be
+embedded, `2` means embeddings are disabled.
+
+While a backfill is pending, semantic results are simply incomplete — `coverage`
+shows exactly how incomplete.
 
 ## Try it
 
@@ -119,13 +249,14 @@ The response is a page, not a bare list:
 there is another page. `limit` is 1-100 (default 20) and `offset` must be zero
 or greater.
 
-Search rules:
+Search rules for `GET /memories?q=`:
 
 - Every word must appear somewhere in the memory (`q=dark+mode` needs both).
 - Words match as prefixes, so `q=depl` finds "Deploys".
 - Case and diacritics are ignored, so `q=cafe` finds "Café".
 - Only the requesting user's memories are searched.
-- Results are ordered newest first, not by relevance; ranking comes later.
+- Results stay newest first. For relevance ranking, use
+  `POST /memories/search`, documented above.
 
 ### Update a memory
 
@@ -141,8 +272,10 @@ Invoke-RestMethod -Method Patch `
 
 `updated_at` is refreshed on every successful update; `created_at` never
 changes. An empty body, a `null` field, or an unknown field returns `422`.
-The search index is updated in the same transaction, so the new text is
-searchable immediately.
+The keyword index is updated in the same transaction, so the new text is
+searchable immediately. A content change also re-embeds the memory; if the
+embedding provider is down, the update still succeeds, the old vector is
+deleted, and search coverage reports the gap rather than returning stale text.
 
 ### Delete a memory
 
@@ -165,7 +298,16 @@ Every test runs against a fresh SQLite file inside pytest's temporary
 directory, so the development database is never touched. Coverage includes
 creation, retrieval, listing, filters, ordering, pagination, keyword search
 (both FTS5 and the LIKE fallback), search-input safety, update semantics,
-deletion, and cross-user isolation.
+deletion, cross-user isolation, vector maths, embedding lifecycle, backfill,
+degradation, and database upgrades.
+
+**The suite is offline by construction.** An autouse fixture in
+`tests/conftest.py` replaces `socket.create_connection` with a guard that fails
+the test, so any accidental outbound connection is caught rather than silently
+reaching a provider. `tests/test_offline.py` proves the guard is armed.
+
+Deterministic tests use the fake provider. They verify plumbing and ordering,
+not semantic quality — see the fake-provider note above.
 
 Lint and format checks:
 
@@ -181,18 +323,29 @@ recallkit/
 ├── app/
 │   ├── main.py                    # create_app() factory, lifespan, GET /health
 │   ├── config.py                  # Settings from RECALLKIT_* env vars / .env
-│   ├── db.py                      # SQLite connections + schema initialization
+│   ├── db.py                      # connections, FK enforcement, schema init
 │   ├── models.py                  # Pydantic request/response schemas
+│   ├── cli.py                     # backfill-embeddings maintenance command
 │   ├── api/
-│   │   ├── deps.py                # dependency wiring (settings, connection, service)
-│   │   └── memories.py            # all /memories routes
+│   │   ├── deps.py                # dependency wiring
+│   │   ├── memories.py            # /memories CRUD routes
+│   │   └── search.py              # POST /memories/search
 │   ├── repositories/
-│   │   ├── memories.py            # all SQL for memories
+│   │   ├── memories.py            # SQL for memories, incl. bm25 ranking
+│   │   ├── embeddings.py          # SQL for vectors
 │   │   └── search.py              # safe FTS5 / LIKE query builders
-│   ├── services/memory_service.py # IDs, timestamps, not-found rule
-│   └── llm/                       # provider interface + offline fake (unused for now)
-├── schema.sql                     # memories table, indexes, FTS5 index, triggers
-├── tests/                         # pytest suite
+│   ├── retrieval/vectors.py       # float32 packing and cosine similarity
+│   ├── services/
+│   │   ├── memory_service.py      # IDs, timestamps, re-indexing rules
+│   │   ├── embedding_index.py     # best-effort vector maintenance
+│   │   └── search_service.py      # modes, fusion, coverage, degradation
+│   └── llm/
+│       ├── base.py                # LLMProvider + EmbeddingProvider Protocols
+│       ├── fake.py                # offline deterministic providers
+│       ├── openai_compatible.py   # /v1/embeddings over httpx
+│       └── factory.py             # provider construction from settings
+├── schema.sql                     # memories, FTS5, embeddings, triggers
+├── tests/                         # pytest suite (offline)
 ├── requirements.txt               # pinned runtime dependencies
 ├── requirements-dev.txt           # pinned test dependencies
 └── pyproject.toml                 # pytest and ruff configuration
@@ -216,6 +369,7 @@ The layers exist to keep each change small:
 | `POST` | `/memories` | Store a memory. Body: `user_id`, `content`, optional `agent_id`, optional `kind` |
 | `GET` | `/memories` | List one page. Query: `user_id` (required), `agent_id`, `kind`, `q`, `limit`, `offset` |
 | `GET` | `/memories/{id}?user_id=...` | Read one memory owned by that user, else `404` |
+| `POST` | `/memories/search` | Ranked retrieval. Body: `user_id`, `query`, `mode`, optional `agent_id`, `kind`, `limit` |
 | `PATCH` | `/memories/{id}?user_id=...` | Change `content` and/or `kind`, else `404` |
 | `DELETE` | `/memories/{id}?user_id=...` | Permanently delete; `204` on success, `404` otherwise |
 
@@ -269,7 +423,70 @@ than operators. The LIKE fallback escapes `\`, `%` and `_` and passes the
 pattern as a bound parameter with `ESCAPE '\'`. Every query still has
 `m.user_id = ?` in its `WHERE` clause.
 
+```sql
+CREATE TABLE memory_embeddings (
+    memory_id  TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    model      TEXT NOT NULL,   -- vectors from different models are never compared
+    dimensions INTEGER NOT NULL,
+    vector     BLOB NOT NULL,   -- little-endian float32, L2-normalised
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (memory_id, model)
+);
+```
+
+Vectors live in their own table so switching embedding models never touches
+`memories` and never mixes incompatible vectors: retrieval only reads rows for
+the configured model. The foreign key cascades, which is why
+`Database.connect()` enables `PRAGMA foreign_keys` on every connection — SQLite
+defaults to off. Deleting a memory therefore deletes its vectors atomically.
+
+### How semantic search runs
+
+1. The query text is embedded once, with the same model used at write time.
+2. That user's vectors are loaded with `agent_id`/`kind` filters applied in SQL.
+3. Cosine similarity is computed in Python over the candidate set (bounded by
+   `RECALLKIT_SEMANTIC_MAX_CANDIDATES`), unpacking float32 blobs.
+4. Candidates below `RECALLKIT_SEMANTIC_MIN_SIMILARITY` are dropped and the
+   rest are ranked.
+
+It is a brute-force scan, deliberately. At a few thousand memories per user it
+takes milliseconds and needs no extra infrastructure. `numpy` or `sqlite-vec`
+are the upgrade path once measurements justify them.
+
+### How search stays safe
+
+User text is never concatenated into SQL. `app/repositories/search.py` splits
+the query into word tokens and builds the FTS5 expression by wrapping each
+token in double quotes and appending `*` for prefix matching, so characters
+such as `"`, `*`, `:`, `-`, `^` and `NEAR(` are treated as literal text rather
+than operators. The LIKE fallback escapes `\`, `%` and `_` and passes the
+pattern as a bound parameter with `ESCAPE '\'`. Every query — keyword or
+vector — still has `m.user_id = ?` in its `WHERE` clause.
+
+## Limitations
+
+- **The fake provider has no semantic understanding.** It measures word overlap.
+  Deterministic tests prove plumbing, not retrieval quality. Do not judge
+  "does it understand meaning?" from a fake-provider result.
+- **No evaluation harness yet.** There is no labeled dataset or recall@k report;
+  that was planned for a later stage. Tuning fusion weights without it is
+  guesswork.
+- **Brute-force vectors.** Scanning is capped and linear in the number of
+  memories per user. Past the cap, only the newest memories are considered.
+- **Corrupt vectors are invisible, not fatal.** A row whose stored dimensions
+  disagree with its blob is skipped and logged. `coverage.embedded` counts rows
+  present, so it can overstate usable vectors if the table was damaged by hand.
+- **No auth.** `user_id` is caller-asserted. Do not expose this service beyond
+  localhost until authentication exists.
+- **No conversation ingestion or fact extraction yet.** Memories are stored
+  exactly as the client sends them.
+- **One model at a time.** Vectors for a superseded model stay on disk; they are
+  ignored, not cleaned up.
+- **Provider failures are logged, not surfaced per write.** A failed embed
+  yields a normal `201`/`200`; the gap shows up as `coverage`.
+
 ## Next milestone (not implemented)
 
-Authentication, then semantic retrieval behind the existing `LLMProvider`
-interface. Listing, searching, updating and deleting are complete.
+Conversation ingestion and fact extraction through the existing `LLMProvider`
+seam, then memory quality (deduplication and conflicting facts). Retrieval,
+including semantic and hybrid modes, is complete for now.
