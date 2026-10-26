@@ -10,7 +10,10 @@ import sqlite3
 from app.models import Memory
 from app.repositories.search import build_fts_expression, build_like_patterns
 
-_COLUMNS = "m.id, m.user_id, m.agent_id, m.content, m.kind, m.created_at, m.updated_at"
+_COLUMNS = (
+    "m.id, m.user_id, m.agent_id, m.content, m.kind, m.created_at, m.updated_at, "
+    "m.status, m.superseded_at, m.superseded_by, m.superseded_reason, m.superseded_note"
+)
 
 # Newest first. `id` breaks ties so pagination is stable even when two rows
 # share a timestamp.
@@ -49,6 +52,49 @@ class MemoryRepository:
         assert stored is not None
         return stored
 
+    def insert_rows(self, memories: list[Memory]) -> None:
+        """Insert several memories without committing.
+
+        Used by conversation ingestion so memory rows, the conversation receipt,
+        and provenance are committed as one unit. Must run inside a transaction
+        (see :mod:`app.repositories.transactions`).
+        """
+        if not memories:
+            return
+        self._connection.executemany(
+            """
+            INSERT INTO memories
+                (id, user_id, agent_id, content, kind, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    memory.id,
+                    memory.user_id,
+                    memory.agent_id,
+                    memory.content,
+                    memory.kind,
+                    memory.created_at.isoformat(),
+                    memory.updated_at.isoformat(),
+                )
+                for memory in memories
+            ],
+        )
+
+    def contents_by_status(self, user_id: str) -> list[tuple[str, str]]:
+        """Return ``(content, status)`` for every memory the user owns.
+
+        Duplicate detection canonicalises these in Python: SQLite's ``lower()``
+        is ASCII-only and cannot strip punctuation or normalise Unicode. The
+        cost is linear in a user's memory count, which is acceptable at this
+        scale and revisited when a canonical key column is added.
+        """
+        rows = self._connection.execute(
+            "SELECT content, status FROM memories WHERE user_id = ?",
+            (user_id,),
+        ).fetchall()
+        return [(row["content"], row["status"]) for row in rows]
+
     def get(self, memory_id: str, *, user_id: str) -> Memory | None:
         """Return one memory, or None if it does not exist *for this user*.
 
@@ -58,7 +104,8 @@ class MemoryRepository:
         """
         row = self._connection.execute(
             """
-            SELECT id, user_id, agent_id, content, kind, created_at, updated_at
+            SELECT id, user_id, agent_id, content, kind, created_at, updated_at,
+                   status, superseded_at, superseded_by, superseded_reason, superseded_note
             FROM memories
             WHERE id = ? AND user_id = ?
             """,
