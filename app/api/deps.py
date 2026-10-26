@@ -15,11 +15,14 @@ from fastapi import Depends, Request
 from app.config import Settings
 from app.db import Database
 from app.llm.base import EmbeddingProvider, LLMProvider
+from app.repositories.conflicts import ConflictRepository
 from app.repositories.conversations import ConversationRepository
 from app.repositories.embeddings import EmbeddingRepository
 from app.repositories.memories import MemoryRepository
+from app.services.conflict_service import ConflictService
 from app.services.conversation_service import ConversationService
 from app.services.embedding_index import EmbeddingIndex
+from app.services.explain_service import ExplainService
 from app.services.memory_service import MemoryService
 from app.services.search_service import SearchService
 
@@ -71,6 +74,12 @@ def get_conversation_repository(
     return ConversationRepository(connection)
 
 
+def get_conflict_repository(
+    connection: Annotated[sqlite3.Connection, Depends(get_connection)],
+) -> ConflictRepository:
+    return ConflictRepository(connection)
+
+
 def get_embedding_index(
     repository: Annotated[EmbeddingRepository, Depends(get_embedding_repository)],
     provider: Annotated[EmbeddingProvider | None, Depends(get_embedding_provider)],
@@ -79,10 +88,37 @@ def get_embedding_index(
 
 
 def get_memory_service(
+    connection: Annotated[sqlite3.Connection, Depends(get_connection)],
     repository: Annotated[MemoryRepository, Depends(get_memory_repository)],
     embeddings: Annotated[EmbeddingIndex, Depends(get_embedding_index)],
+    conflicts: Annotated[ConflictRepository, Depends(get_conflict_repository)],
 ) -> MemoryService:
-    return MemoryService(repository, embeddings)
+    return MemoryService(repository, embeddings, conflicts=conflicts, connection=connection)
+
+
+def get_conflict_service(
+    connection: Annotated[sqlite3.Connection, Depends(get_connection)],
+    memories: Annotated[MemoryRepository, Depends(get_memory_repository)],
+    conflicts: Annotated[ConflictRepository, Depends(get_conflict_repository)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> ConflictService:
+    return ConflictService(
+        connection=connection, memories=memories, conflicts=conflicts, settings=settings
+    )
+
+
+def get_explain_service(
+    memories: Annotated[MemoryRepository, Depends(get_memory_repository)],
+    conversations: Annotated[ConversationRepository, Depends(get_conversation_repository)],
+    embeddings: Annotated[EmbeddingRepository, Depends(get_embedding_repository)],
+    conflicts: Annotated[ConflictRepository, Depends(get_conflict_repository)],
+) -> ExplainService:
+    return ExplainService(
+        memories=memories,
+        conversations=conversations,
+        embeddings=embeddings,
+        conflicts=conflicts,
+    )
 
 
 def get_search_service(
@@ -105,6 +141,7 @@ def get_conversation_service(
     memories: Annotated[MemoryRepository, Depends(get_memory_repository)],
     memory_service: Annotated[MemoryService, Depends(get_memory_service)],
     provider: Annotated[LLMProvider | None, Depends(get_llm_provider)],
+    conflicts: Annotated[ConflictService, Depends(get_conflict_service)],
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> ConversationService:
     return ConversationService(
@@ -113,6 +150,7 @@ def get_conversation_service(
         memories=memories,
         memory_service=memory_service,
         provider=provider,
+        conflicts=conflicts,
         settings=settings,
     )
 
@@ -121,3 +159,5 @@ SettingsDep = Annotated[Settings, Depends(get_settings)]
 MemoryServiceDep = Annotated[MemoryService, Depends(get_memory_service)]
 SearchServiceDep = Annotated[SearchService, Depends(get_search_service)]
 ConversationServiceDep = Annotated[ConversationService, Depends(get_conversation_service)]
+ConflictServiceDep = Annotated[ConflictService, Depends(get_conflict_service)]
+ExplainServiceDep = Annotated[ExplainService, Depends(get_explain_service)]

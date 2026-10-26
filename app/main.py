@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Response, status
 from fastapi.responses import RedirectResponse
 
-from app.api import conversations, memories, search
+from app.api import conflicts, conversations, memories, search
 from app.config import Settings
 from app.db import Database
 from app.llm.factory import build_embedding_provider, build_llm_provider
@@ -80,6 +80,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(memories.router)
     app.include_router(search.router)
     app.include_router(conversations.router)
+    app.include_router(conflicts.router)
 
     @app.get("/", include_in_schema=False)
     def root() -> RedirectResponse:

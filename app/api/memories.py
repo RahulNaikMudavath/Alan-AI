@@ -1,18 +1,30 @@
-"""HTTP routes for memories."""
+"""HTTP routes for memories, lifecycle, and explainability."""
 
 from typing import Annotated
 
 from fastapi import APIRouter, HTTPException, Query, Response, status
 
-from app.api.deps import MemoryServiceDep
-from app.models import Memory, MemoryCreate, MemoryKind, MemoryList, MemoryUpdate
-from app.services.memory_service import MemoryNotFoundError
+from app.api.deps import ConflictServiceDep, ExplainServiceDep, MemoryServiceDep
+from app.models import (
+    Memory,
+    MemoryCreate,
+    MemoryExplainResponse,
+    MemoryKind,
+    MemoryList,
+    MemoryStatusFilter,
+    MemoryUpdate,
+    SupersedeRequest,
+    SupersedeResponse,
+)
+from app.services.errors import MemoryNotFoundError, MemorySupersededError
+from app.services.supersession import SupersedeConflictError
 
 router = APIRouter(prefix="/memories", tags=["memories"])
 
 # The same message is used for "does not exist" and "belongs to someone else",
 # so a caller cannot probe for the existence of other users' memories.
 _NOT_FOUND = "Memory not found"
+_SUPERSEDED = "Memory is superseded and can no longer be edited"
 
 # Repeated on every route: there is no authentication yet, so the caller states
 # which user it is acting for. This is the single place that placeholder lives.
@@ -27,9 +39,18 @@ UserIdQuery = Annotated[
 
 
 @router.post("", response_model=Memory, status_code=status.HTTP_201_CREATED)
-def create_memory(payload: MemoryCreate, service: MemoryServiceDep) -> Memory:
-    """Store a memory for ``payload.user_id``."""
-    return service.remember(payload)
+def create_memory(
+    payload: MemoryCreate,
+    service: MemoryServiceDep,
+    conflicts: ConflictServiceDep,
+) -> Memory:
+    """Store a memory for ``payload.user_id``.
+
+    Conflict detection runs afterwards, best effort, and never changes state.
+    """
+    memory = service.remember(payload)
+    conflicts.detect_for(memory)
+    return memory
 
 
 @router.get("", response_model=MemoryList)
@@ -44,6 +65,16 @@ def list_memories(
         MemoryKind | None,
         Query(description="Only memories of this kind."),
     ] = None,
+    status_filter: Annotated[
+        MemoryStatusFilter,
+        Query(
+            alias="status",
+            description=(
+                "Lifecycle filter. 'active' (default) is the current memory; "
+                "'superseded' or 'all' expose history."
+            ),
+        ),
+    ] = "active",
     q: Annotated[
         str | None,
         Query(
@@ -63,6 +94,7 @@ def list_memories(
         user_id=user_id,
         agent_id=agent_id,
         kind=kind,
+        status=status_filter,
         query=q,
         limit=limit,
         offset=offset,
@@ -72,9 +104,25 @@ def list_memories(
 
 @router.get("/{memory_id}", response_model=Memory)
 def read_memory(memory_id: str, user_id: UserIdQuery, service: MemoryServiceDep) -> Memory:
-    """Return one memory, or 404 if it does not belong to ``user_id``."""
+    """Return one memory, or 404 if it does not belong to ``user_id``.
+
+    Superseded memories remain readable here and in ``/explain``.
+    """
     try:
         return service.get(memory_id, user_id=user_id)
+    except MemoryNotFoundError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_NOT_FOUND) from None
+
+
+@router.get("/{memory_id}/explain", response_model=MemoryExplainResponse)
+def explain_memory(
+    memory_id: str,
+    user_id: UserIdQuery,
+    service: ExplainServiceDep,
+) -> MemoryExplainResponse:
+    """Separate observed provenance and indexes from heuristic inferences."""
+    try:
+        return service.explain(memory_id, user_id=user_id)
     except MemoryNotFoundError:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_NOT_FOUND) from None
 
@@ -82,19 +130,44 @@ def read_memory(memory_id: str, user_id: UserIdQuery, service: MemoryServiceDep)
 @router.patch(
     "/{memory_id}",
     response_model=Memory,
-    responses={404: {"description": _NOT_FOUND}},
+    responses={404: {"description": _NOT_FOUND}, 409: {"description": _SUPERSEDED}},
 )
 def update_memory(
     memory_id: str,
     payload: MemoryUpdate,
     user_id: UserIdQuery,
     service: MemoryServiceDep,
+    conflicts: ConflictServiceDep,
 ) -> Memory:
-    """Change the content and/or kind of one memory."""
+    """Change the content and/or kind of one active memory."""
     try:
-        return service.update(memory_id, user_id=user_id, payload=payload)
+        updated = service.update(memory_id, user_id=user_id, payload=payload)
     except MemoryNotFoundError:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_NOT_FOUND) from None
+    except MemorySupersededError:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=_SUPERSEDED) from None
+    conflicts.detect_for(updated)
+    return updated
+
+
+@router.post(
+    "/{memory_id}/supersede",
+    response_model=SupersedeResponse,
+    responses={404: {"description": _NOT_FOUND}, 409: {"description": "Invalid state"}},
+)
+def supersede_memory(
+    memory_id: str,
+    payload: SupersedeRequest,
+    user_id: UserIdQuery,
+    service: MemoryServiceDep,
+) -> SupersedeResponse:
+    """Retire a memory in favour of another. Explicit and auditable."""
+    try:
+        return service.supersede(memory_id, user_id=user_id, payload=payload)
+    except MemoryNotFoundError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_NOT_FOUND) from None
+    except SupersedeConflictError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from None
 
 
 @router.delete(
@@ -104,7 +177,7 @@ def update_memory(
     responses={404: {"description": _NOT_FOUND}},
 )
 def delete_memory(memory_id: str, user_id: UserIdQuery, service: MemoryServiceDep) -> Response:
-    """Permanently delete one memory."""
+    """Permanently delete one memory, active or superseded."""
     try:
         service.delete(memory_id, user_id=user_id)
     except MemoryNotFoundError:
