@@ -42,3 +42,21 @@ def test_default_configuration_uses_the_offline_provider(client: TestClient) -> 
 
     assert provider is not None
     assert provider.model.startswith("recallkit-fake-hash-")
+
+
+def test_conversation_ingestion_needs_no_network(client: TestClient) -> None:
+    response = client.post(
+        "/conversations",
+        json={
+            "user_id": "user-a",
+            "conversation_id": "offline-1",
+            "messages": [
+                {"role": "user", "content": "I'm vegetarian and I prefer tea."},
+            ],
+        },
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["extractor"]["provider"] == "fake"
+    assert len(body["memories_created"]) >= 1

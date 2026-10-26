@@ -9,6 +9,7 @@ The suite is also offline by construction: an autouse fixture replaces
 fails the test that attempted it.
 """
 
+import json
 import socket
 import sqlite3
 from collections.abc import Callable, Iterator
@@ -20,6 +21,7 @@ from fastapi.testclient import TestClient
 
 from app.config import Settings
 from app.db import Database
+from app.llm.fake import ScriptedLLMProvider
 from app.main import create_app
 from app.repositories.embeddings import EmbeddingRepository
 from app.retrieval.vectors import pack_vector
@@ -37,11 +39,15 @@ def no_network(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture
 def settings(tmp_path: Path) -> Settings:
-    return Settings(
+    resolved = Settings(
         _env_file=None,  # ignore a developer's .env during tests
         database_path=tmp_path / "recallkit-test.db",
         environment="test",
     )
+    # Startup never creates schema, so tests initialize explicitly. This is a
+    # setup-only step; no assertions change.
+    Database(resolved.database_path).initialize()
+    return resolved
 
 
 @pytest.fixture
@@ -115,5 +121,50 @@ def make_memory(client: TestClient) -> Callable[..., dict[str, object]]:
         response = client.post("/memories", json=payload)
         assert response.status_code == 201, response.text
         return response.json()
+
+    return _make
+
+
+@pytest.fixture
+def scripted_llm(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> Callable[..., ScriptedLLMProvider]:
+    """Replace the app's extraction provider with a scripted one.
+
+    Returning the provider lets tests assert how many times it was called, which
+    is how idempotency and pre-provider limit checks are proven.
+    """
+
+    def _install(*responses: str) -> ScriptedLLMProvider:
+        provider = ScriptedLLMProvider(responses)
+        monkeypatch.setattr(client.app.state, "llm_provider", provider)
+        return provider
+
+    return _install
+
+
+@pytest.fixture
+def extraction_json() -> Callable[..., str]:
+    """Build a well-formed extraction response from fact dictionaries."""
+
+    def _build(*items: dict[str, object]) -> str:
+        return json.dumps({"memories": list(items)})
+
+    return _build
+
+
+@pytest.fixture
+def make_conversation() -> Callable[..., dict[str, object]]:
+    """Build a valid POST /conversations body, with overrides."""
+
+    def _make(**overrides: object) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "user_id": "user-a",
+            "conversation_id": "conv-1",
+            "agent_id": "support-bot",
+            "messages": [{"role": "user", "content": "I'm vegetarian."}],
+        }
+        payload.update(overrides)
+        return payload
 
     return _make
