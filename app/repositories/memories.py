@@ -124,6 +124,88 @@ class MemoryRepository:
             )
         return cursor.rowcount > 0
 
+    def count(
+        self,
+        *,
+        user_id: str,
+        agent_id: str | None = None,
+        kind: str | None = None,
+    ) -> int:
+        """Count the user's memories after filters, ignoring paging and search."""
+        filters, params = self._filters(user_id, agent_id, kind)
+        return self._connection.execute(
+            f"SELECT COUNT(*) FROM memories m WHERE {' AND '.join(filters)}",
+            params,
+        ).fetchone()[0]
+
+    def recent_ids(
+        self,
+        *,
+        user_id: str,
+        agent_id: str | None = None,
+        kind: str | None = None,
+        limit: int,
+    ) -> list[str]:
+        """Return ids newest first. Feeds the recency signal of hybrid ranking."""
+        filters, params = self._filters(user_id, agent_id, kind)
+        rows = self._connection.execute(
+            f"SELECT m.id FROM memories m WHERE {' AND '.join(filters)} {_ORDER} LIMIT ?",
+            [*params, limit],
+        ).fetchall()
+        return [row["id"] for row in rows]
+
+    def search_ranked(
+        self,
+        *,
+        user_id: str,
+        query: str,
+        agent_id: str | None = None,
+        kind: str | None = None,
+        limit: int,
+    ) -> list[Memory]:
+        """Keyword search ordered by FTS5 relevance (bm25), best match first.
+
+        This is deliberately separate from :meth:`list`, whose newest-first
+        ordering is part of the existing ``GET /memories`` contract. Relevance
+        ordering is only used by ``POST /memories/search``.
+        """
+        filters, params = self._filters(user_id, agent_id, kind)
+        expression = build_fts_expression(query)
+        if expression is not None:
+            try:
+                rows = self._connection.execute(
+                    f"""
+                    SELECT {_COLUMNS}
+                    FROM memories m
+                    JOIN memories_fts ON memories_fts.memory_id = m.id
+                    WHERE {" AND ".join([*filters, "memories_fts MATCH ?"])}
+                    ORDER BY bm25(memories_fts) ASC, m.created_at DESC, m.id DESC
+                    LIMIT ?
+                    """,
+                    [*params, expression, limit],
+                ).fetchall()
+                return [Memory(**dict(row)) for row in rows]
+            except sqlite3.OperationalError:
+                # No FTS5 index: fall through to LIKE with newest-first order,
+                # which is the same degraded behaviour as the list endpoint.
+                pass
+
+        patterns = build_like_patterns(query)
+        if not patterns:
+            return []
+        like_filters = [*filters, *(r"m.content LIKE ? ESCAPE '\'" for _ in patterns)]
+        rows = self._connection.execute(
+            f"""
+            SELECT {_COLUMNS}
+            FROM memories m
+            WHERE {" AND ".join(like_filters)}
+            {_ORDER}
+            LIMIT ?
+            """,
+            [*params, *patterns, limit],
+        ).fetchall()
+        return [Memory(**dict(row)) for row in rows]
+
     # -- internals ---------------------------------------------------------
 
     @staticmethod
