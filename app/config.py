@@ -93,6 +93,12 @@ class Settings(BaseSettings):
     # they are not written to disk unless a deployment opts in.
     store_messages: bool = False
 
+    # -- local dashboard ---------------------------------------------------
+    # A developer tool with no authentication. Disable it for shared environments.
+    dashboard_enabled: bool = True
+    # Where the Evaluation Lab looks for generated benchmark reports.
+    eval_reports_path: Path = PROJECT_ROOT / "eval" / "reports"
+
     # -- conflict candidates -----------------------------------------------
     # Detection is advisory only: it never changes a memory's status.
     conflict_detection_enabled: bool = True

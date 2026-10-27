@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>RecallKit Dashboard</title>
+  <link rel="stylesheet" href="/dashboard/assets/styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#view">Skip to content</a>
+
+  <header class="topbar">
+    <a class="brand" href="#/overview" aria-label="RecallKit dashboard home">
+      <span class="brand-mark" aria-hidden="true">RK</span>
+      <span>RecallKit</span>
+    </a>
+    <nav class="nav" aria-label="Dashboard sections">
+      <a href="#/overview" data-nav="overview">Overview</a>
+      <a href="#/explorer" data-nav="explorer">Explorer</a>
+      <a href="#/debugger" data-nav="debugger">Debugger</a>
+      <a href="#/evaluation" data-nav="evaluation">Evaluation</a>
+    </nav>
+    <form class="user-form" id="user-form">
+      <label for="user-id">User</label>
+      <input id="user-id" name="user-id" autocomplete="off" spellcheck="false"
+             aria-describedby="user-hint">
+      <button class="btn small" type="submit">Apply</button>
+      <span class="health-dot" id="health-dot" title="Checking service health"></span>
+    </form>
+  </header>
+
+  <p class="local-banner" role="note">
+    <strong>Local developer tool.</strong> No authentication. <code>user_id</code>
+    is caller-asserted, so do not expose this server beyond localhost.
+    <span id="user-hint" class="sr-only">The selected user scopes every request.</span>
+  </p>
+
+  <main id="view" tabindex="-1"></main>
+  <div id="toasts" class="toasts" aria-live="polite" aria-atomic="false"></div>
+
+  <script type="module" src="/dashboard/assets/app.js"></script>
+</body>
+</html>

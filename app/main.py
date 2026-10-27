@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Response, status
 from fastapi.responses import RedirectResponse
 
-from app.api import conflicts, conversations, memories, search
+from app.api import conflicts, conversations, dashboard, memories, search
 from app.config import Settings
 from app.db import Database
 from app.llm.factory import build_embedding_provider, build_llm_provider
@@ -81,6 +81,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(search.router)
     app.include_router(conversations.router)
     app.include_router(conflicts.router)
+    if resolved.dashboard_enabled:
+        # Local developer dashboard. Same origin, no authentication, no CORS.
+        app.include_router(dashboard.router)
+        app.mount(
+            "/dashboard/assets",
+            dashboard.DashboardStaticFiles(directory=dashboard.ASSETS_DIR),
+            name="dashboard-assets",
+        )
 
     @app.get("/", include_in_schema=False)
     def root() -> RedirectResponse:
