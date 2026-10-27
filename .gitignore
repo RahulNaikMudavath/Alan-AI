@@ -8,15 +8,28 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 
-# Local database backups
+# Local databases, data, and backups (never commit data/recallkit.db)
 data/
 backups/
 *.db
 *.db-wal
 *.db-shm
+*.sqlite
+*.sqlite3
+
+# Temporary test artifacts and browser profiles
+browser-profile/
+*.log
+
+# Generated evaluation reports (preserve baseline reports; ignore disposable outputs)
+eval/reports/*
+!eval/reports/retrieval-v1-offline-run1.json
+!eval/reports/only-editor.json
+!eval/reports/.gitkeep
 
 # Local environment overrides (secrets belong here, never in git)
 .env
+.env.local
 
 # Editor / OS noise
 .vscode/

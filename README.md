@@ -1,911 +1,438 @@
 # RecallKit
 
-Persistent memory for AI agents. RecallKit is a small REST API that stores
-facts, preferences and events per user in SQLite and returns them on demand, so
-an agent can remember useful context between conversations.
+> An inspectable memory layer for AI agents.
 
-This repository currently contains **Milestone 3.3**: create, read, list,
-keyword search, update and delete, retrieval by meaning (semantic and hybrid),
-conversation ingestion with fact extraction, and a memory lifecycle with
-explicit supersession, conflict candidates, and explainability. Every operation
-is scoped to one user. There is no authentication, SDK, dashboard, or frontend,
-and the service is not production-secure without authentication.
+RecallKit is a transparent, explainable memory layer for AI agents built with Python, FastAPI, and SQLite. It extracts durable facts and preferences from multi-turn conversations, links every record to its exact provenance, resolves contradicting updates through explicit lifecycle states, and ranks retrieval with hybrid keyword + vector search — all inspectable in real time via an embedded, dependency-free developer dashboard.
 
-## Requirements
+Targeted at developers building autonomous agents and conversational assistants, RecallKit replaces opaque vector stores with an inspectable system where memory decisions, superseded facts, candidate conflicts, and retrieval scores are fully visible, auditable, and testable offline.
 
-- Python 3.11 or newer (developed and tested on Python 3.14)
-- Windows PowerShell (commands below), or the equivalent on macOS/Linux
+---
 
-No API keys are needed. Both model-backed features default to deterministic
-offline fakes — embeddings for retrieval, and a rule-based extractor for
-conversation ingestion — so the app, the CLI, and the entire test suite run with
-no network access and no cost. Keyword search uses SQLite's built-in FTS5, with a
-`LIKE` fallback if FTS5 is unavailable in your Python build.
+## At a Glance
 
-## Setup (Windows PowerShell)
+- **Deterministic & Offline-First**: Zero mandatory API keys, external SaaS dependencies, or vector databases. Runs locally on standard SQLite with deterministic fakes for embeddings and fact extraction. Pluggable to any OpenAI-compatible `/v1/embeddings` and `/v1/chat/completions` endpoint.
+- **Verifiable Provenance**: Every extracted memory references its source conversation ID and exact message indexes.
+- **Explicit Lifecycle & Supersession**: Newer statements don't silently overwrite older ones; superseded facts are preserved for historical audit while filtered from default search.
+- **Heuristic Conflict Review**: Automatically flags opposing statements (e.g., *"prefers dark mode"* vs *"prefers light mode"*) for explicit resolution (*Keep A*, *Keep B*, or *Keep Both*).
+- **Hybrid Retrieval & Explainability**: Reciprocal Rank Fusion (RRF) combining SQLite FTS5 (BM25) and cosine similarity with recency re-ranking. The API and UI explicitly report `matched_by`, vector coverage, and score contributions.
+- **Ground-Truth Evaluation Lab**: Built-in evaluation harness measuring Precision@K, Recall@K, MRR, and nDCG against versioned ground-truth datasets with deterministic SHA-256 report fingerprinting.
+- **Dependency-Free Dashboard**: Pure vanilla HTML, CSS, and ES modules served directly by the FastAPI process. No `npm`, node build step, external CDNs, or third-party tracking.
 
-```powershell
-Set-Location "D:\aiml related projects\recallkit"
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -r requirements-dev.txt
-# create the database (required before the first run)
-.\.venv\Scripts\python.exe -m app.cli init
+---
+
+## Visual Product Tour
+
+| System Overview | Memory Explorer |
+| :---: | :---: |
+| [![Overview](docs/screenshots/overview.png)](docs/screenshots/overview.png) | [![Memory Explorer](docs/screenshots/explorer.png)](docs/screenshots/explorer.png) |
+| *Live health metrics, active/superseded counts, and guided demo walkthrough with query chips.* | *Lifecycle badges, provenance links, searchable supersession picker, and conflict resolution.* |
+
+| Retrieval Debugger | Evaluation Lab |
+| :---: | :---: |
+| [![Retrieval Debugger](docs/screenshots/debugger.png)](docs/screenshots/debugger.png) | [![Evaluation Lab](docs/screenshots/evaluation.png)](docs/screenshots/evaluation.png) |
+| *Side-by-side comparison across Keyword, Semantic, and Hybrid modes with diagnostic classifications.* | *Versioned benchmark inspection, metric deltas, failure category audits, and offline caveats.* |
+
+---
+
+## The Problem: Why Inspectable Memory Matters
+
+Most AI agent memory architectures suffer from three fatal flaws:
+
+1. **The Vector Black Box**: When an agent retrieves the wrong memory, there is no way to diagnose why. Cosine similarity offers no visibility into why a particular chunk ranked higher than another, or whether a critical keyword was ignored.
+2. **Silent Contradictions & Amnesia**: When a user changes their preference (e.g. *"I switched from Python to Go"*), naive vector systems store both memories. Retrieval then randomly returns either the current preference or the obsolete one depending on phrasing.
+3. **Missing Auditability & Provenance**: Agents hallucinate facts, but developers cannot tell whether the agent hallucinated during extraction or retrieved an incorrect chunk. Without verified conversation references, human-in-the-loop debugging is impossible.
+
+RecallKit solves this by making memory state **structured, inspectable, and lifecycle-aware**:
+- Current state is separated from history (`active` vs `superseded`).
+- Extracted memories retain foreign keys to their exact conversation receipts.
+- Opposing statements generate candidate conflicts for review.
+- Search signals are combined using rank fusion, returning transparent breakdown metadata (`matched_by`, cosine similarity, and RRF score).
+
+---
+
+## Guided Demo Walkthrough
+
+The embedded dashboard (<http://127.0.0.1:8000/dashboard/>) provides a four-step walkthrough:
+
+1. **System Overview (`#/overview`)**:
+   - Inspect live memory counts, superseded history counts, open conflict candidate counts, and available evaluation reports.
+   - Click verified demo query chips (`editor theme preference`, `oat milk flat white`, `Friday deploy`, `greyhound Pixel`, `payments backend`) to launch prefilled queries directly into the Debugger.
+2. **Memory Explorer (`#/explorer`)**:
+   - Browse active and superseded memories with kind filters (`fact`, `preference`, `event`, `task`).
+   - Click **Inspect** to review observed conversation provenance and message positions.
+   - Resolve open conflicts using **Keep A**, **Keep B**, or **Keep Both**.
+   - Supersede a memory using the interactive candidate picker, previewing both old and replacement content before confirming.
+3. **Retrieval Debugger (`#/debugger`)**:
+   - Execute queries simultaneously across **Keyword (FTS5)**, **Semantic (cosine)**, and **Hybrid (RRF + recency)**.
+   - Inspect hit counts, vector coverage, raw cosine similarities, and relative RRF ranking scores.
+   - Test diagnostic assertions with optional **Expected IDs** and **Forbidden IDs**, classifying results into *expected*, *forbidden*, *foreign_user*, *unexpected*, and *missing*.
+4. **Evaluation Lab (`#/evaluation`)**:
+   - Review versioned evaluation runs without rerunning computations.
+   - Compare two reports side-by-side with automated compatibility checks (verifying identical dataset SHA-256, K values, and evaluated query subsets).
+   - Inspect metric deltas alongside explicit warnings regarding offline lexical limitations.
+
+---
+
+## Architecture & Data Flow
+
+RecallKit follows a layered, decoupled architecture with strict data boundaries:
+
+```mermaid
+flowchart TD
+    subgraph Client ["Client & Agent Layer"]
+        Agent[Agent / LLM App]
+        User[Developer Browser]
+    end
+
+    subgraph API ["FastAPI Routers (app/api)"]
+        R_Health["GET /health"]
+        R_Memories["/memories (CRUD, Supersede, Explain)"]
+        R_Search["POST /memories/search"]
+        R_Convs["POST /conversations"]
+        R_Conflicts["/memory-conflicts"]
+        R_Dash["/dashboard (Static UI & Report Reader)"]
+    end
+
+    subgraph Services ["Domain Services (app/services)"]
+        MS[MemoryService]
+        SS[SearchService]
+        CS[ConversationService]
+        CFS[ConflictService]
+        ES[ExplainService]
+        SUPS[SupersessionService]
+        RRF[Reciprocal Rank Fusion]
+    end
+
+    subgraph Providers ["Pluggable Providers (app/llm)"]
+        LLM_P{LLM Provider}
+        EMB_P{Embedding Provider}
+        FakeLLM[Rule-Based Heuristic Extractor]
+        FakeEmb[Deterministic Lexical Hash Vectorizer]
+        OpenAI_LLM["OpenAI /v1/chat/completions"]
+        OpenAI_Emb["OpenAI /v1/embeddings"]
+    end
+
+    subgraph Storage ["SQLite Storage (app/repositories)"]
+        DB[(recallkit.db WAL mode)]
+        T_Mem[memories table]
+        T_FTS[memories_fts FTS5]
+        T_Emb[memory_embeddings]
+        T_Conv[conversations & receipts]
+        T_Src[memory_sources]
+        T_Conf[memory_conflicts]
+        T_Msg[conversation_messages]
+    end
+
+    subgraph EvalEngine ["Evaluation Lab (app/evaluation)"]
+        Dataset[Versioned Dataset JSON]
+        Runner[Evaluation Runner]
+        Metrics[Precision, Recall, MRR, nDCG]
+        Reports[Deterministic Report JSON]
+    end
+
+    Agent -->|HTTP/JSON| R_Memories
+    Agent -->|HTTP/JSON| R_Search
+    Agent -->|HTTP/JSON| R_Convs
+    User -->|HTTP/HTML| R_Dash
+    User -->|REST| R_Conflicts
+
+    R_Memories --> MS
+    R_Memories --> SUPS
+    R_Memories --> ES
+    R_Search --> SS
+    R_Convs --> CS
+    R_Conflicts --> CFS
+
+    CS --> LLM_P
+    MS --> EMB_P
+    SS --> EMB_P
+    SS --> RRF
+
+    LLM_P --> FakeLLM
+    LLM_P --> OpenAI_LLM
+    EMB_P --> FakeEmb
+    EMB_P --> OpenAI_Emb
+
+    MS --> DB
+    SS --> DB
+    CS --> DB
+    CFS --> DB
+    SUPS --> DB
+
+    Runner --> Dataset
+    Runner --> SS
+    Runner --> Metrics
+    Metrics --> Reports
+    R_Dash -.-> Reports
 ```
 
-If PowerShell refuses to run `Activate.ps1` because of the execution policy,
-you do not need to activate the environment at all. Call the interpreter
-directly instead:
+### Architectural Principles
 
-```powershell
-.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
-.\.venv\Scripts\python.exe -m app.cli init
-```
+- **Zero SQL in Routers**: Routers only handle request parsing, dependency injection, and HTTP status codes.
+- **SQL Scoping by User ID**: Every database query explicitly filters by `user_id` in the `WHERE` clause, ensuring zero accidental cross-user leakage.
+- **No In-Server Schema Migrations**: The server checks `PRAGMA user_version` on startup and refuses to start if migrations are pending. Migrations are strictly explicit CLI operations.
+- **Unpacked Float Vectors in SQLite**: Vectors are stored as little-endian `float32` BLOBs. Cosine similarity runs via efficient standard library unpacking without heavy external vector dependencies.
 
-## Run the API
+---
 
-```powershell
-.\.venv\Scripts\python.exe -m uvicorn app.main:app --reload
-```
+## Technology Stack
 
-Then open <http://127.0.0.1:8000/docs> for interactive API documentation, or
-check health:
+- **Backend**: Python 3.11+ (tested on Python 3.14), FastAPI, Uvicorn, Pydantic v2, Pydantic-Settings.
+- **Database**: SQLite 3 with FTS5, WAL (Write-Ahead Logging), and immediate transactions.
+- **Dashboard**: Vanilla JavaScript (ES2022 modules), native CSS variables, responsive design (390px, 768px, 1280px). Zero npm packages, zero external CDNs.
+- **Evaluation**: Custom ground-truth evaluation engine with deterministic SHA-256 fingerprinting.
+- **Code Quality**: Ruff (linter and formatter), Pytest, DevTools Chrome DevTools Protocol (CDP) for browser regression tests.
 
-```powershell
-curl.exe http://127.0.0.1:8000/health
-```
+---
 
-Expected response: `{"status":"ok","database":"ok"}`.
-
-Application startup **never creates or upgrades the database**. It verifies
-`PRAGMA user_version` and refuses to start when the schema is missing, behind,
-or newer than the build. The refusal names the path, the versions, and the
-command to run. That is deliberate: a schema change should never happen as a
-side effect of starting a web server.
-
-The SQLite file lives at `data/recallkit.db` by default. Override the location
-by copying `.env.example` to `.env` and editing `RECALLKIT_DATABASE_PATH`, or by
-setting that environment variable directly. `.env`, `data/`, and `backups/` are
-git-ignored.
-
-## Schema migrations
-
-```powershell
-# New database. Works with no schema present; refuses an existing one.
-.\.venv\Scripts\python.exe -m app.cli init
-
-# Existing database: inspect, back up, then apply.
-.\.venv\Scripts\python.exe -m app.cli migrate --check
-.\.venv\Scripts\python.exe -m app.cli migrate
-```
-
-`migrate --check` writes nothing; exit code `0` means current, `1` means pending
-or uninitialized. `migrate` ensures the baseline tables exist (old databases may
-lack tables added by later milestones) and then applies pending migrations, each
-inside one `BEGIN IMMEDIATE` transaction that also bumps `PRAGMA user_version`.
-A failure rolls the whole file back and leaves the version unchanged.
-
-### Back up before migrating
-
-Copying a live SQLite database is unsafe because WAL content may not be
-checkpointed. Stop the server first.
-
-```powershell
-# 1. stop the server (Ctrl+C in its terminal)
-# 2. copy the database and its WAL/SHM companions
-New-Item -ItemType Directory -Force .\backups | Out-Null
-Copy-Item .\data\recallkit.db, .\data\recallkit.db-wal, .\data\recallkit.db-shm `
-    .\backups\ -ErrorAction SilentlyContinue
-
-# 3. migrate
-.\.venv\Scripts\python.exe -m app.cli migrate
-
-# 4. start the server
-.\.venv\Scripts\python.exe -m uvicorn app.main:app --reload
-```
-
-Restore with the server stopped:
-
-```powershell
-Copy-Item .\backups\recallkit.db* .\data\ -Force
-```
-
-Rolling the code back to an earlier milestone is safe: older inserts name their
-columns explicitly, and the lifecycle columns have defaults.
-
-## Embedding providers
-
-Semantic search needs vectors, so creating or editing a memory also embeds it.
-Choose the provider with `RECALLKIT_EMBEDDING_PROVIDER`:
-
-| Value | What it does | Cost | Use it for |
-| --- | --- | --- | --- |
-| `fake` (default) | Hashes words into a fixed-size vector | Free, offline | Development, tests, demos |
-| `openai_compatible` | Calls any `POST /v1/embeddings` endpoint | Provider's price per token | Real retrieval quality |
-| `none` | No vectors; semantic search reports `degraded` | Free | Keyword-only deployments |
-
-```powershell
-# Real embeddings. The key comes from the environment, never from source.
-$env:RECALLKIT_EMBEDDING_PROVIDER = "openai_compatible"
-$env:RECALLKIT_EMBEDDING_API_KEY  = "<your key>"
-$env:RECALLKIT_EMBEDDING_BASE_URL = "https://api.openai.com/v1"
-$env:RECALLKIT_EMBEDDING_MODEL    = "text-embedding-3-small"
-$env:RECALLKIT_EMBEDDING_DIMENSIONS = "1536"
-```
-
-Any compatible endpoint works: Azure OpenAI, a local Ollama or vLLM server, or
-an internal gateway. Only `base_url`, `model`, and `dimensions` change. If the
-provider is set to `openai_compatible` without a key, startup fails with a
-message naming the missing variable.
-
-The key is read into a `SecretStr`, sent only as an `Authorization` header, and
-never logged or included in an exception message. Put it in `.env` (git-ignored)
-or your shell environment. Never commit it.
-
-### What the fake provider does and does not do
-
-The fake is a **bag-of-words hasher**. It scores shared words (and adjacent word
-pairs), so `"dark mode"` is close to `"prefers dark mode"`. It has no notion of
-synonyms: `"diet"` is not close to `"vegetarian"`.
-
-That is deliberate. It makes the plumbing deterministic and free to test:
-ranking, fusion, isolation, coverage, and degradation are all verified exactly.
-It proves **no semantic understanding**, and this project does not claim any.
-Real retrieval quality requires a real embedding model; the limits section
-below explains how little the fake can be trusted for that.
-
-## Semantic and hybrid retrieval
-
-`POST /memories/search` is the relevance-ranked endpoint. `GET /memories?q=`
-is unchanged and remains newest-first.
-
-```powershell
-$search = @{
-    user_id = "user-a"
-    query   = "what does this person eat?"
-    mode    = "hybrid"      # keyword | semantic | hybrid
-    limit   = 5
-} | ConvertTo-Json
-
-Invoke-RestMethod -Method Post `
-    -Uri http://127.0.0.1:8000/memories/search `
-    -ContentType "application/json" `
-    -Body $search
-```
-
-```json
-{
-  "mode": "hybrid",
-  "query": "what does this person eat?",
-  "degraded": false,
-  "coverage": { "embedded": 12, "considered": 13 },
-  "results": [
-    {
-      "memory": { "id": "...", "content": "Is vegetarian", "kind": "fact", "...": "..." },
-      "score": 0.0325,
-      "similarity": 0.71,
-      "matched_by": ["keyword", "semantic"]
-    }
-  ]
-}
-```
-
-How to read the response:
-
-- **`matched_by`** says which signals found the memory: FTS5 keywords, cosine
-  similarity, or both.
-- **`similarity`** is the raw cosine score when the semantic signal matched, in
-  `[-1, 1]`. `null` means the memory was never compared as a vector.
-- **`score`** is a fused rank score, **relative within this response only**. It
-  is not a probability and is not comparable between requests.
-- **`degraded: true`** means semantic scoring was requested but unavailable
-  (no provider, or the provider failed), so results come from keyword matching
-  only. The app never silently pretends otherwise.
-- **`coverage`** reports how many of the user's scoped memories have a vector
-  for the active model versus how many exist. It is the honest measure of what
-  semantic search could see.
-
-Modes:
-
-| Mode | Behaviour |
-| --- | --- |
-| `keyword` | FTS5 only, ordered by bm25 relevance. Prefix matching still applies. |
-| `semantic` | Cosine similarity only, above `RECALLKIT_SEMANTIC_MIN_SIMILARITY`. |
-| `hybrid` (default) | Reciprocal Rank Fusion of both lists, plus a recency signal. |
-
-**Why rank fusion.** A cosine similarity is bounded and positive-ish; bm25 is
-unbounded and negative. Adding them requires inventing calibration constants.
-Reciprocal Rank Fusion uses only positions — `weight / (60 + rank)` per list —
-so it needs no training and no tuning to behave sanely. Recency can only
-reorder memories that a real signal already matched; it never invents a hit.
-
-Every mode applies `user_id`, `agent_id`, and `kind` in the SQL `WHERE` clause,
-so a filter cannot be bypassed by switching modes.
-
-### Backfilling existing memories
-
-Memories written before this milestone have no vectors. Index them with the
-CLI, which is safe to rerun:
-
-```powershell
-.\.venv\Scripts\python.exe -m app.cli backfill-embeddings
-.\.venv\Scripts\python.exe -m app.cli backfill-embeddings --user-id user-a --batch-size 25
-```
-
-It only adds vectors for the configured model where none exist. It never
-overwrites an existing vector and never touches vectors belonging to a
-different model, so switching models later cannot corrupt the old data. Exit
-code `0` means nothing failed, `1` means at least one memory could not be
-embedded, `2` means embeddings are disabled.
-
-While a backfill is pending, semantic results are simply incomplete — `coverage`
-shows exactly how incomplete.
-
-## Conversation ingestion
-
-`POST /conversations` accepts a conversation, asks the configured model to
-extract durable facts, and stores them through the same memory service as
-everything else.
-
-```powershell
-$body = @{
-    user_id         = "user-a"
-    conversation_id = "conv-2026-10-26-001"
-    agent_id        = "support-bot"
-    messages        = @(
-        @{ role = "user";      content = "I'm vegetarian and I deploy on Fridays." },
-        @{ role = "assistant"; content = "Noted." }
-    )
-} | ConvertTo-Json -Depth 5
-
-Invoke-RestMethod -Method Post `
-    -Uri http://127.0.0.1:8000/conversations `
-    -ContentType "application/json" `
-    -Body $body
-```
-
-```json
-{
-  "conversation_id": "conv-2026-10-26-001",
-  "replayed": false,
-  "messages_received": 2,
-  "memories_created": [
-    { "id": "…", "user_id": "user-a", "agent_id": "support-bot",
-      "content": "I'm vegetarian", "kind": "fact", "...": "..." }
-  ],
-  "memories_skipped": [
-    { "content": "Deploys on Fridays", "kind": "event",
-      "reason": "duplicate_existing", "source_message_indexes": [0] }
-  ],
-  "extractor": { "provider": "fake", "model": "recallkit-rule-based-v1",
-                 "prompt_version": "extract-v1" }
-}
-```
-
-`source_message_indexes` are 0-based positions in the submitted conversation and
-are stored in `memory_sources`, so every extracted memory can be traced back to
-the message that produced it.
-
-### Idempotency
-
-`conversation_id` is client-supplied and scoped by `user_id`, so two users can use
-the same value independently. The request payload is hashed and stored with the
-receipt:
-
-| Request | Result |
-| --- | --- |
-| New `conversation_id` | `201 Created`, provider called once |
-| Same id, **identical** payload | `200 OK`, `replayed: true`, provider **not** called |
-| Same id, **different** payload | `409 Conflict`, nothing written, provider **not** called |
-
-A replay returns the stored receipt exactly as it was issued. If a memory has
-since been edited or deleted, the receipt still describes what that ingestion
-produced — it is a record, not a live view.
-
-### Duplicate detection
-
-Facts are compared using a documented canonical form:
-
-1. **Unicode** NFKC, so `ＤＡＲＫ` and `DARK` are the same text.
-2. **Case** folding, so `STRAßE` and `strasse` match.
-3. **Punctuation** replaced by spaces, so `"Dark mode!"` and `"dark mode"` match.
-4. **Whitespace** runs collapsed and trimmed, including tabs, newlines, and
-   non-breaking spaces.
-
-It deliberately does **not** remove diacritics (`café` and `cafe` stay distinct)
-and it does not understand meaning (`vegetarian` and `plant-based` are different).
-Known trade-offs: `C#` collides with `C` because `#` is punctuation, while `C++`
-does not; `don't` becomes `don t` and differs from `dont`.
-
-A duplicate is never stored. It is reported in `memories_skipped` with one of:
-
-| Reason | Meaning |
-| --- | --- |
-| `duplicate_existing` | Same canonical content already stored for this user |
-| `duplicate_in_request` | Repeated within the model's own output |
-| `low_confidence` | Below `RECALLKIT_MIN_FACT_CONFIDENCE` |
-| `too_long` | Longer than `RECALLKIT_MAX_FACT_CHARS` |
-| `invalid_fact` | Failed per-fact validation (wrong kind, blank, out of range) |
-| `limit_exceeded` | Beyond `RECALLKIT_MAX_FACTS_PER_CONVERSATION` |
-
-### Limits and failure behaviour
-
-| Situation | Response |
-| --- | --- |
-| More messages, or more characters, than configured | `422`, provider never called |
-| Extraction disabled (`RECALLKIT_LLM_PROVIDER=none`) and the conversation is new | `503` |
-| Provider error | `502` |
-| Output is not JSON, or not the expected top-level shape | `502`, nothing written |
-| One bad fact inside otherwise valid output | `201`, that fact reported as `invalid_fact` |
-
-A stored receipt can still be replayed with extraction disabled: replaying costs
-nothing and needs no provider. Only new conversations return `503`.
-
-The conversation receipt, its memories, and its provenance are committed in one
-transaction. A failure at any point leaves no partial conversation. Embeddings
-are generated after that commit, best effort: a memory is never rolled back
-because an embedding provider was unavailable, and search coverage shows the gap.
-
-### Raw message storage
-
-`RECALLKIT_STORE_MESSAGES` is `false` by default. When disabled, only extracted
-facts and message indexes are written; the conversation text is not persisted.
-Set it to `true` if you need the raw conversation for audit or re-extraction, and
-treat the database as sensitive.
-
-### Configuring the extractor
-
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `RECALLKIT_LLM_PROVIDER` | `fake` | `fake`, `openai_compatible`, or `none` |
-| `RECALLKIT_LLM_MODEL` | provider default | Recorded in every receipt |
-| `RECALLKIT_LLM_BASE_URL` | `https://api.openai.com/v1` | Any compatible endpoint |
-| `RECALLKIT_LLM_API_KEY` | — | Env only, never logged |
-| `RECALLKIT_MAX_MESSAGES_PER_CONVERSATION` | `50` | Request-size guard |
-| `RECALLKIT_MAX_MESSAGE_CHARS` | `8000` | Request-size guard |
-| `RECALLKIT_MAX_CONVERSATION_CHARS` | `40000` | Request-size guard |
-| `RECALLKIT_MAX_FACTS_PER_CONVERSATION` | `10` | Quality cap |
-| `RECALLKIT_MAX_FACT_CHARS` | `500` | Quality cap |
-| `RECALLKIT_MIN_FACT_CONFIDENCE` | `0.5` | Quality floor |
-
-The fake extractor is a **rule-based heuristic**, not a model: it keeps
-first-person sentences from user messages and labels them with a few cue words.
-It exists so the pipeline runs offline and so tests can pin exact behaviour.
-Real extraction quality requires `openai_compatible`.
-
-Conversation text is untrusted input. The prompt marks it as data and instructs
-the model to ignore instructions inside it, but the real protection is
-downstream: only a narrow typed schema can become a memory, and nothing extracted
-is ever executed.
-
-## Memory lifecycle
-
-| Status | Searchable | Listed by default | Read by id | Editable | Deletable |
-| --- | --- | --- | --- | --- | --- |
-| `active` | yes | yes | yes | yes | yes |
-| `superseded` | no | no | yes | no (`409`) | yes |
-| deleted | no | no | no | — | already gone |
-
-Deleting is still a hard delete. Superseded memories are history: retained,
-readable, and excluded from retrieval.
-
-```powershell
-# Supersede an old memory in favour of a newer one
-$supersede = @{
-    superseded_by = $new.id
-    reason        = "user_correction"   # user_correction | outdated | contradiction | duplicate | other
-    note          = "User changed their preference"
-} | ConvertTo-Json
-Invoke-RestMethod -Method Post `
-    -Uri "http://127.0.0.1:8000/memories/$($old.id)/supersede?user_id=user-a" `
-    -ContentType "application/json" `
-    -Body $supersede
-
-# History is browsable without polluting normal lists
-Invoke-RestMethod "http://127.0.0.1:8000/memories?user_id=user-a&status=superseded"
-Invoke-RestMethod "http://127.0.0.1:8000/memories?user_id=user-a&status=all"
-```
-
-`POST /memories/search` always returns active memories only. `PATCH` on a
-superseded memory returns `409`; the record is history and should not be edited.
-Deleting a memory that was used as a replacement clears the pointer
-(`superseded_by: null`) but keeps the timestamp and reason.
-
-## Conflicts are candidates, not verdicts
-
-RecallKit detects **one narrow pattern**: two active memories with heavily
-overlapping words where exactly one side contains an explicit negation.
-
-- Detected: "I like coffee" vs "I do not like coffee".
-- Not detected (false negatives): "prefers dark mode" vs "prefers light mode",
-  "is vegetarian" vs "eats meat".
-- Possible false positive: "I never drink coffee at night" vs "I drink coffee" —
-  both can be true in different contexts.
-
-Detection writes a candidate row with its evidence and **never changes a memory's
-status**. Nothing is auto-resolved, and no confidence score is invented; the
-recorded `token_containment` is a lexical observation, not a probability.
-
-```powershell
-# See candidates
-Invoke-RestMethod "http://127.0.0.1:8000/memory-conflicts?user_id=user-a&status=open"
-
-# Resolve explicitly: keep_a, keep_b, or keep_both
-$resolution = @{ user_id = "user-a"; resolution = "keep_b"; note = "Newer wording wins" } | ConvertTo-Json
-Invoke-RestMethod -Method Post `
-    -Uri "http://127.0.0.1:8000/memory-conflicts/$($conflict.id)/resolve" `
-    -ContentType "application/json" `
-    -Body $resolution
-```
-
-`keep_a` / `keep_b` supersede the losing memory with reason `contradiction` in
-the same transaction. `keep_both` closes the candidate and leaves both active.
-Resolving twice returns `409`. For a correction the detector cannot see, use
-`POST /memories/{id}/supersede` directly — that is the only way a memory becomes
-superseded.
-
-A scan re-runs detection over existing memories and is safe to repeat:
-
-```powershell
-Invoke-RestMethod -Method Post "http://127.0.0.1:8000/memory-conflicts/scan?user_id=user-a"
-```
-
-## Explain a memory
-
-```powershell
-Invoke-RestMethod "http://127.0.0.1:8000/memories/$($created.id)/explain?user_id=user-a"
-```
-
-```json
-{
-  "memory": { "id": "…", "status": "active", "...": "..." },
-  "observed": {
-    "origin": "conversation",
-    "sources": [{ "conversation_id": "conv-…", "message_indexes": [0],
-                  "extractor": { "provider": "fake", "model": "…", "prompt_version": "extract-v1" } }],
-    "indexes": { "keyword": true, "embedding_models": ["recallkit-fake-hash-v1-256"] },
-    "lifecycle": { "status": "active", "superseded_at": null, "superseded_by": null,
-                   "reason": null, "note": null }
-  },
-  "inferred": {
-    "conflict_candidates": [{ "conflict_id": "…", "other_memory_id": "…",
-                              "rule": "explicit_negation",
-                              "evidence": { "shared_terms": ["coffee", "like"], "...": "..." },
-                              "status": "open" }]
-  }
-}
-```
-
-`observed` is read from stored rows. `inferred` is the lexical heuristic. Raw
-conversation messages are never returned here, even when
-`RECALLKIT_STORE_MESSAGES=true`; only their indexes are exposed.
-
-## Try it
-
-PowerShell mangles JSON passed to `curl.exe` on the command line, so use
-`Invoke-RestMethod` instead:
-
-```powershell
-$body = @{
-    user_id = "user-a"
-    content = "Prefers dark mode"
-    kind    = "preference"
-} | ConvertTo-Json
-
-$created = Invoke-RestMethod -Method Post `
-    -Uri http://127.0.0.1:8000/memories `
-    -ContentType "application/json" `
-    -Body $body
-
-$created
-```
-
-The response contains an `id`. Read the memory back with that id:
-
-```powershell
-Invoke-RestMethod "http://127.0.0.1:8000/memories/$($created.id)?user_id=user-a"
-```
-
-Reading with a different `user_id` returns `404`, exactly as if the memory did
-not exist:
-
-```powershell
-Invoke-RestMethod "http://127.0.0.1:8000/memories/$($created.id)?user_id=user-b"
-```
-
-If you prefer `curl.exe`, put the JSON in a file and pass `-d "@body.json"`;
-embedding JSON directly in a PowerShell command line corrupts the quotes.
-
-### List and search
-
-```powershell
-# Newest 20 memories for one user
-Invoke-RestMethod "http://127.0.0.1:8000/memories?user_id=user-a"
-
-# Filter by agent and kind, then page through the results
-Invoke-RestMethod "http://127.0.0.1:8000/memories?user_id=user-a&agent_id=agent-1&kind=preference&limit=10&offset=0"
-
-# Keyword search
-Invoke-RestMethod "http://127.0.0.1:8000/memories?user_id=user-a&q=dark+mode"
-```
-
-The response is a page, not a bare list:
-
-```json
-{
-  "items": [ { "id": "...", "content": "Prefers dark mode", "...": "..." } ],
-  "total": 42,
-  "limit": 20,
-  "offset": 0
-}
-```
-
-`total` counts every match ignoring paging, so `offset + limit < total` means
-there is another page. `limit` is 1-100 (default 20) and `offset` must be zero
-or greater.
-
-Search rules for `GET /memories?q=`:
-
-- Every word must appear somewhere in the memory (`q=dark+mode` needs both).
-- Words match as prefixes, so `q=depl` finds "Deploys".
-- Case and diacritics are ignored, so `q=cafe` finds "Café".
-- Only the requesting user's memories are searched.
-- Results stay newest first. For relevance ranking, use
-  `POST /memories/search`, documented above.
-
-### Update a memory
-
-Send only the fields you want to change:
-
-```powershell
-$patch = @{ content = "Prefers dark mode, never light." } | ConvertTo-Json
-Invoke-RestMethod -Method Patch `
-    -Uri "http://127.0.0.1:8000/memories/$($created.id)?user_id=user-a" `
-    -ContentType "application/json" `
-    -Body $patch
-```
-
-`updated_at` is refreshed on every successful update; `created_at` never
-changes. An empty body, a `null` field, or an unknown field returns `422`.
-The keyword index is updated in the same transaction, so the new text is
-searchable immediately. A content change also re-embeds the memory; if the
-embedding provider is down, the update still succeeds, the old vector is
-deleted, and search coverage reports the gap rather than returning stale text.
-
-### Delete a memory
-
-```powershell
-Invoke-RestMethod -Method Delete `
-    -Uri "http://127.0.0.1:8000/memories/$($created.id)?user_id=user-a"
-```
-
-Deletion is permanent and returns `204 No Content`. Deleting the same memory
-again returns `404`. Deleting or changing another user's memory also returns
-`404`, and leaves their data untouched. Deleting a memory cascades to its
-embeddings, provenance rows, and conflict candidates.
-
-## Deletion and privacy
-
-`DELETE /memories/{id}` removes the memory row. Foreign keys cascade to
-`memory_embeddings`, `memory_sources`, and `memory_conflicts`, so those derived
-rows disappear with it. Deleting a memory used as a replacement clears
-`superseded_by` on the superseded row.
-
-**It is not complete erasure.** Deleting a memory does **not** erase its content
-from:
-
-- `conversations.result_json`, the stored receipt for the ingestion that
-  produced it, which still contains a snapshot of the memory;
-- `conversation_messages`, when `RECALLKIT_STORE_MESSAGES=true` has stored the
-  raw conversation.
-
-Those rows are deliberately retained so idempotent replay keeps working and so
-provenance remains auditable. Conversation-level deletion and a retention policy
-are **future work**; there is no endpoint that removes a conversation or its
-messages. If you enable raw message storage, treat the database as containing
-sensitive conversation data and manage retention outside RecallKit for now.
-
-Superseded memories remain on disk until explicitly deleted. They are excluded
-from search but are not a privacy boundary; delete them if they should not be
-kept.
-
-## Tests
-
-```powershell
-.\.venv\Scripts\python.exe -m pytest -q
-```
-
-Every test runs against a fresh SQLite file inside pytest's temporary
-directory, so the development database is never touched. Coverage includes
-creation, retrieval, listing, filters, ordering, pagination, keyword search
-(both FTS5 and the LIKE fallback), search-input safety, update semantics,
-deletion, cross-user isolation, vector maths, embedding lifecycle, backfill,
-degradation, database upgrades, conversation ingestion, extraction parsing,
-duplicate canonicalisation, idempotency replays and conflicts, provenance,
-request limits, provider failures, transactional rollback, schema migrations,
-lifecycle and supersession, conflict detection and resolution, explainability,
-search filtering of history, deletion cascades, and receipt-retention behaviour.
-
-**The suite is offline by construction.** An autouse fixture in
-`tests/conftest.py` replaces `socket.create_connection` with a guard that fails
-the test, so any accidental outbound connection is caught rather than silently
-reaching a provider. `tests/test_offline.py` proves the guard is armed and drives
-both retrieval and ingestion while it is.
-
-Deterministic tests use the fake providers. They verify plumbing and ordering,
-not semantic or extraction quality — see the notes above.
-
-Lint and format checks:
-
-```powershell
-.\.venv\Scripts\python.exe -m ruff check .
-.\.venv\Scripts\python.exe -m ruff format --check .
-```
-
-## Project layout
+## Repository Structure
 
 ```
 recallkit/
 ├── app/
-│   ├── main.py                    # create_app() factory, lifespan, GET /health
-│   ├── config.py                  # Settings from RECALLKIT_* env vars / .env
-│   ├── db.py                      # connections, FK enforcement, schema init
-│   ├── models.py                  # Pydantic request/response schemas
-│   ├── cli.py                     # backfill-embeddings maintenance command
-│   ├── api/
-│   │   ├── deps.py                # dependency wiring
-│   │   ├── memories.py            # /memories CRUD routes
-│   │   ├── search.py              # POST /memories/search
-│   │   └── conversations.py       # POST /conversations
-│   ├── repositories/
-│   │   ├── memories.py            # SQL for memories, incl. bm25 ranking
-│   │   ├── embeddings.py          # SQL for vectors
-│   │   ├── conversations.py       # receipts, provenance, optional messages
-│   │   ├── transactions.py        # BEGIN IMMEDIATE / rollback helper
-│   │   └── search.py              # safe FTS5 / LIKE query builders
-│   ├── retrieval/vectors.py       # float32 packing and cosine similarity
-│   ├── services/
-│   │   ├── memory_service.py      # IDs, timestamps, re-indexing rules
-│   │   ├── embedding_index.py     # best-effort vector maintenance
-│   │   ├── search_service.py      # modes, fusion, coverage, degradation
-│   │   ├── canonical.py           # duplicate + payload canonicalisation
-│   │   ├── extraction.py          # prompt building and output parsing
-│   │   └── conversation_service.py# ingestion orchestration and atomic writes
-│   └── llm/
-│       ├── base.py                # LLMProvider + EmbeddingProvider Protocols
-│       ├── fake.py                # offline deterministic providers
-│       ├── prompt_contract.py     # prompt marker shared with the fake
-│       ├── openai_compatible.py   # /v1/embeddings and /v1/chat/completions
-│       └── factory.py             # provider construction from settings
-├── schema.sql                     # memories, FTS5, embeddings, conversations
-├── tests/                         # pytest suite (offline)
-├── requirements.txt               # pinned runtime dependencies
-├── requirements-dev.txt           # pinned test dependencies
-└── pyproject.toml                 # pytest and ruff configuration
+│   ├── main.py                     # FastAPI application factory & lifespan
+│   ├── config.py                   # Pydantic settings & environment configuration
+│   ├── db.py                       # SQLite connection management & PRAGMA guards
+│   ├── models.py                   # API request & response schemas
+│   ├── cli.py                      # CLI commands: init, migrate, seed-demo, evaluate
+│   ├── api/                        # REST endpoint routers
+│   │   ├── memories.py             # CRUD, supersede, and explain
+│   │   ├── search.py               # Ranked multi-mode search
+│   │   ├── conversations.py        # Ingestion & fact extraction
+│   │   ├── conflicts.py            # Conflict review & resolution
+│   │   └── dashboard.py            # Static asset mounting & report reader
+│   ├── repositories/               # SQLite database access layer
+│   │   ├── memories.py             # Memory CRUD & status filtering
+│   │   ├── search.py               # FTS5 & LIKE search queries
+│   │   ├── embeddings.py           # Float32 BLOB vector storage
+│   │   ├── conversations.py        # Conversation receipts & idempotency
+│   │   └── conflicts.py            # Conflict candidate storage
+│   ├── services/                   # Core business logic
+│   │   ├── memory_service.py       # ID generation, validation, CRUD
+│   │   ├── search_service.py       # Keyword, semantic, and RRF hybrid retrieval
+│   │   ├── conversation_service.py # Ingestion pipeline orchestration
+│   │   ├── extraction.py           # Prompt formatting & output parsing
+│   │   ├── conflict_service.py     # Negation & lexical conflict detection
+│   │   └── supersession.py         # Explicit memory retirement
+│   ├── llm/                        # Pluggable model providers
+│   │   ├── base.py                 # Protocol interfaces
+│   │   ├── fake.py                 # Deterministic offline fakes
+│   │   ├── openai_compatible.py    # OpenAI / Ollama / vLLM client
+│   │   └── factory.py              # Provider factory from settings
+│   ├── migrations/                 # Versioned schema migrations
+│   │   ├── runner.py               # Transactional migration engine
+│   │   └── 0001_memory_lifecycle.sql
+│   └── evaluation/                 # Retrieval evaluation engine
+│       ├── dataset.py              # Schema validation & integrity
+│       ├── runner.py               # Evaluation execution pipeline
+│       ├── metrics.py              # Precision, Recall, MRR, nDCG
+│       └── report.py               # JSON report generator & fingerprinting
+├── dashboard/                      # Developer dashboard frontend
+│   ├── index.html                  # Dashboard HTML shell
+│   └── assets/                     # Vanilla JS modules & CSS stylesheets
+├── docs/                           # Documentation assets
+│   └── screenshots/                # Real dashboard product screenshots
+├── eval/                           # Evaluation assets
+│   ├── datasets/retrieval-v1.json  # 13-query synthetic ground truth
+│   └── reports/                    # Baseline evaluation reports
+├── scripts/                        # Automation & testing scripts
+│   ├── dashboard_browser_check.mjs # DevTools CDP browser regression check
+│   ├── capture_screenshots.py      # Automated genuine screenshot capture runner
+│   └── capture_screenshots.mjs     # CDP screenshot capture automation
+├── tests/                          # 515+ offline pytest test suite
+├── schema.sql                      # Baseline SQLite schema
+├── pyproject.toml                  # Pytest & Ruff configuration
+├── requirements.txt                # Pinned production runtime dependencies
+└── requirements-dev.txt            # Pinned development & testing dependencies
 ```
 
-The layers exist to keep each change small:
+---
 
-- **Routes** translate HTTP to Python and back. No SQL.
-- **Service** holds rules that are neither: generating IDs and timestamps now,
-  calling an LLM later.
-- **Repository** is the only place that writes SQL. Every read filters by
-  `user_id` in the `WHERE` clause, which is what makes cross-user access
-  impossible rather than merely discouraged.
-- **Database** hands each request its own short-lived SQLite connection.
+## Setup Guide (Windows PowerShell)
 
-## API
+### 1. Environment & Dependencies
 
-| Method | Path | Description |
-| --- | --- | --- |
-| `GET` | `/health` | `{"status":"ok","database":"ok"}`, or `503` if storage is broken |
-| `POST` | `/memories` | Store a memory. Body: `user_id`, `content`, optional `agent_id`, optional `kind` |
-| `GET` | `/memories` | List one page. Query: `user_id`, `agent_id`, `kind`, `status`, `q`, `limit`, `offset` |
-| `GET` | `/memories/{id}?user_id=...` | Read one memory (active or superseded), else `404` |
-| `GET` | `/memories/{id}/explain?user_id=...` | Observed provenance and indexes, plus inferred candidates |
-| `POST` | `/memories/{id}/supersede?user_id=...` | Explicitly retire a memory in favour of another |
-| `POST` | `/memories/search` | Ranked retrieval over active memories. Body: `user_id`, `query`, `mode`, filters |
-| `POST` | `/conversations` | Extract memories from messages. Body: `user_id`, `conversation_id`, `messages`, optional `agent_id` |
-| `GET` | `/memory-conflicts` | List conflict candidates. Query: `user_id`, `status`, `limit`, `offset` |
-| `POST` | `/memory-conflicts/{id}/resolve` | Resolve with `keep_a`, `keep_b`, or `keep_both` |
-| `POST` | `/memory-conflicts/scan?user_id=...` | Re-scan existing memories; idempotent |
-| `PATCH` | `/memories/{id}?user_id=...` | Change `content` and/or `kind`; `409` if superseded |
-| `DELETE` | `/memories/{id}?user_id=...` | Permanently delete; `204` on success, `404` otherwise |
+```powershell
+# Clone and enter directory
+cd recallkit
 
-`kind` is one of `fact`, `preference`, `event`, `task` (default `fact`).
-`status` is `active` (default), `superseded`, or `all`.
+# Create and activate virtual environment
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
 
-### Why `user_id` is a query parameter
-
-There is no authentication yet, so the caller states which user it is acting
-for. That is a deliberate placeholder: when authentication arrives, `user_id`
-will come from a verified token instead of the query string. The scoping rule
-in the repository stays the same either way.
-
-## Data model
-
-```sql
-CREATE TABLE memories (
-    id         TEXT PRIMARY KEY,   -- uuid4 hex, generated in the service
-    user_id    TEXT NOT NULL,      -- owner, always required
-    agent_id   TEXT,               -- optional agent that recorded it
-    content    TEXT NOT NULL,
-    kind       TEXT NOT NULL DEFAULT 'fact',
-    created_at TEXT NOT NULL,      -- ISO-8601 UTC
-    updated_at TEXT NOT NULL
-);
+# Upgrade pip and install development dependencies
+python -m pip install --upgrade pip
+python -m pip install -r requirements-dev.txt
 ```
 
-Milestone 3.3 adds lifecycle columns through a migration, not by editing the
-baseline:
-
-```sql
-ALTER TABLE memories ADD COLUMN status TEXT NOT NULL DEFAULT 'active'
-    CHECK (status IN ('active', 'superseded'));
-ALTER TABLE memories ADD COLUMN superseded_at TEXT;
-ALTER TABLE memories ADD COLUMN superseded_by TEXT
-    REFERENCES memories(id) ON DELETE SET NULL;
-ALTER TABLE memories ADD COLUMN superseded_reason TEXT;
-ALTER TABLE memories ADD COLUMN superseded_note TEXT;
-
-CREATE TABLE memory_conflicts (
-    id          TEXT PRIMARY KEY,
-    user_id     TEXT NOT NULL,
-    memory_a    TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
-    memory_b    TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
-    status      TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'resolved')),
-    rule        TEXT NOT NULL,
-    evidence    TEXT NOT NULL,
-    resolution  TEXT CHECK (resolution IS NULL OR resolution IN
-                    ('kept_a', 'kept_b', 'kept_both', 'superseded')),
-    detected_at TEXT NOT NULL,
-    resolved_at TEXT,
-    CHECK (memory_a < memory_b),
-    UNIQUE (user_id, memory_a, memory_b)
-);
+*Note: If PowerShell script execution is restricted on your machine, run commands directly via the virtual environment's executable:*
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
 ```
 
-`superseded_by` uses `ON DELETE SET NULL`, so deleting the replacement does not
-block deleting the old row. `memory_conflicts` cascades when either memory is
-deleted. `status = 'active'` is applied to every retrieval path, and superseded
-rows stay in the FTS5 index but are filtered out at query time.
+### 2. Configuration
 
-Search uses a standalone FTS5 table plus three triggers:
+Copy the example environment configuration:
+```powershell
+Copy-Item .env.example .env
+```
+RecallKit runs completely offline by default using deterministic fakes (`RECALLKIT_EMBEDDING_PROVIDER=fake`, `RECALLKIT_LLM_PROVIDER=fake`). No external API keys are required.
 
-```sql
-CREATE VIRTUAL TABLE memories_fts USING fts5(
-    memory_id UNINDEXED,
-    content,
-    tokenize = 'unicode61 remove_diacritics 2'
-);
+To use real embeddings or an LLM, configure `.env`:
+```ini
+RECALLKIT_EMBEDDING_PROVIDER=openai_compatible
+RECALLKIT_EMBEDDING_API_KEY=your-api-key-here
+RECALLKIT_EMBEDDING_MODEL=text-embedding-3-small
+RECALLKIT_EMBEDDING_DIMENSIONS=1536
+
+RECALLKIT_LLM_PROVIDER=openai_compatible
+RECALLKIT_LLM_API_KEY=your-api-key-here
+RECALLKIT_LLM_MODEL=gpt-4o-mini
 ```
 
-`memories_fts` stores its own copy of the content. That costs a little disk
-space but keeps the schema simple: no `content=` bookkeeping, and the index is
-maintained by triggers, so it cannot drift from the table even if a row is
-edited by hand with the `sqlite3` shell. On startup a backfill statement
-indexes any rows the index is missing, which is what makes enabling search on
-an existing database safe.
+---
 
-Conversation ingestion adds three tables:
+## Safe Demo Walkthrough
 
-```sql
-CREATE TABLE conversations (
-    user_id          TEXT NOT NULL,
-    conversation_id  TEXT NOT NULL,
-    agent_id         TEXT,
-    message_count    INTEGER NOT NULL,
-    memories_created INTEGER NOT NULL,
-    memories_skipped INTEGER NOT NULL,
-    extractor        TEXT NOT NULL,
-    payload_hash     TEXT NOT NULL,   -- idempotency comparison
-    result_json      TEXT NOT NULL,   -- receipt returned on replay
-    created_at       TEXT NOT NULL,
-    PRIMARY KEY (user_id, conversation_id)
-);
+Run a complete, verified demo using an isolated temporary database. **This never modifies or overwrites your primary database:**
 
-CREATE TABLE memory_sources (
-    memory_id       TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
-    user_id         TEXT NOT NULL,
-    conversation_id TEXT NOT NULL,
-    message_indexes TEXT NOT NULL,   -- JSON array of 0-based positions
-    created_at      TEXT NOT NULL,
-    PRIMARY KEY (memory_id, conversation_id)
-);
+```powershell
+# 1. Point to an isolated temporary database in TEMP
+$env:RECALLKIT_DATABASE_PATH = "$env:TEMP\recallkit-demo.db"
 
-CREATE TABLE conversation_messages (  -- only written when explicitly enabled
-    user_id         TEXT NOT NULL,
-    conversation_id TEXT NOT NULL,
-    position        INTEGER NOT NULL,
-    role            TEXT NOT NULL,
-    content         TEXT NOT NULL,
-    PRIMARY KEY (user_id, conversation_id, position)
-);
+# 2. Initialize schema and seed verified demo records
+.\.venv\Scripts\python.exe -m app.cli init
+.\.venv\Scripts\python.exe -m app.cli seed-demo --user-id demo-user
+
+# 3. Generate a baseline evaluation report for the Evaluation Lab
+.\.venv\Scripts\python.exe -m app.cli evaluate --dataset eval/datasets/retrieval-v1.json --output eval/reports/retrieval-v1-offline-run1.json
+
+# 4. Start the server
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --reload
 ```
 
-`(user_id, conversation_id)` is both the ownership key and the idempotency key.
-`result_json` duplicates memory content on purpose: it lets a replay return the
-original receipt without re-reading rows that may have changed since.
+Open <http://127.0.0.1:8000/dashboard/> in your browser.
 
-```sql
-CREATE TABLE memory_embeddings (
-    memory_id  TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
-    model      TEXT NOT NULL,   -- vectors from different models are never compared
-    dimensions INTEGER NOT NULL,
-    vector     BLOB NOT NULL,   -- little-endian float32, L2-normalised
-    created_at TEXT NOT NULL,
-    PRIMARY KEY (memory_id, model)
-);
+When finished, clean up the temporary database:
+```powershell
+Remove-Item "$env:TEMP\recallkit-demo.db*" -Force -ErrorAction SilentlyContinue
+Remove-Item Env:\RECALLKIT_DATABASE_PATH -ErrorAction SilentlyContinue
 ```
 
-Vectors live in their own table so switching embedding models never touches
-`memories` and never mixes incompatible vectors: retrieval only reads rows for
-the configured model. The foreign key cascades, which is why
-`Database.connect()` enables `PRAGMA foreign_keys` on every connection — SQLite
-defaults to off. Deleting a memory therefore deletes its vectors atomically.
+---
 
-### How semantic search runs
+## Testing & Quality Assurance
 
-1. The query text is embedded once, with the same model used at write time.
-2. That user's vectors are loaded with `agent_id`/`kind` filters applied in SQL.
-3. Cosine similarity is computed in Python over the candidate set (bounded by
-   `RECALLKIT_SEMANTIC_MAX_CANDIDATES`), unpacking float32 blobs.
-4. Candidates below `RECALLKIT_SEMANTIC_MIN_SIMILARITY` are dropped and the
-   rest are ranked.
+RecallKit is verified against a comprehensive automated test suite:
 
-It is a brute-force scan, deliberately. At a few thousand memories per user it
-takes milliseconds and needs no extra infrastructure. `numpy` or `sqlite-vec`
-are the upgrade path once measurements justify them.
+### 1. Unit & Integration Tests (Offline)
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q
+```
+*Expected: 517 passed, 2 skipped (browser tests opt-in; symlink test skipped on Windows).*
 
-### How search stays safe
+### 2. Opt-In Browser Regression Tests
+Verifies dashboard responsiveness across 390px, 768px, and 1280px viewports, tests query comparisons, and checks for zero console errors using Edge/Chromium via CDP:
+```powershell
+$env:RECALLKIT_BROWSER_TESTS = "1"
+.\.venv\Scripts\python.exe -m pytest tests/test_dashboard_browser.py -q
+```
 
-User text is never concatenated into SQL. `app/repositories/search.py` splits
-the query into word tokens and builds the FTS5 expression by wrapping each
-token in double quotes and appending `*` for prefix matching, so characters
-such as `"`, `*`, `:`, `-`, `^` and `NEAR(` are treated as literal text rather
-than operators. The LIKE fallback escapes `\`, `%` and `_` and passes the
-pattern as a bound parameter with `ESCAPE '\'`. Every query — keyword or
-vector — still has `m.user_id = ?` in its `WHERE` clause.
+### 3. Linting & Formatting
+```powershell
+.\.venv\Scripts\ruff.exe check
+.\.venv\Scripts\ruff.exe format --check
+```
 
-## Limitations
+### 4. JavaScript Syntax Validation
+Verify all 9 vanilla JS and MJS modules for ES2022 syntax correctness:
+```powershell
+Get-ChildItem -Path dashboard/assets, scripts -Include *.js, *.mjs -Recurse | ForEach-Object { node --check $_.FullName }
+```
 
-- **The fake provider has no semantic understanding.** It measures word overlap.
-  Deterministic tests prove plumbing, not retrieval quality. Do not judge
-  "does it understand meaning?" from a fake-provider result.
-- **No evaluation harness yet.** There is no labeled dataset or recall@k report;
-  that was planned for a later stage. Tuning fusion weights without it is
-  guesswork.
-- **Brute-force vectors.** Scanning is capped and linear in the number of
-  memories per user. Past the cap, only the newest memories are considered.
-- **Corrupt vectors are invisible, not fatal.** A row whose stored dimensions
-  disagree with its blob is skipped and logged. `coverage.embedded` counts rows
-  present, so it can overstate usable vectors if the table was damaged by hand.
-- **No auth.** `user_id` is caller-asserted. Do not expose this service beyond
-  localhost until authentication exists.
-- **The fake extractor is a heuristic, not a model.** It keeps first-person
-  sentences and guesses a kind from cue words. It proves the pipeline, not
-  extraction quality.
-- **No semantic near-duplicate detection.** Duplicates are exact after
-  canonicalisation; paraphrases still produce separate memories. No conflict
-  supersession yet either, so a changed fact and its older version coexist.
-- **Stored facts can carry injection text.** A memory is plain text that a future
-  prompt may read. The ingestion path ignores instructions in the conversation,
-  but nothing sanitises what is stored.
-- **No auth.** `user_id` is caller-asserted. Do not expose this service beyond
-  localhost until authentication exists.
-- **Provider failures are logged, not surfaced per write.** A failed embed
-  yields a normal `201`/`200`; the gap shows up as `coverage`.
-- **One model at a time.** Vectors for a superseded model stay on disk; they are
-  ignored, not cleaned up.
-- **Retention is manual.** Extracted memories live until deleted, and
-  `RECALLKIT_STORE_MESSAGES=true` makes raw conversations persistent.
-- **Corrupt vectors are invisible, not fatal.** A row whose stored dimensions
-  disagree with its blob is skipped and logged. `coverage.embedded` counts rows
-  present, so it can overstate usable vectors if the table was damaged by hand.
+### 5. Automated Screenshot Capture
+Regenerate genuine documentation screenshots using a fresh temporary database:
+```powershell
+.\.venv\Scripts\python.exe -m scripts.capture_screenshots
+```
 
-## Next milestone (not implemented)
+---
 
-Memory quality beyond exact duplicates: semantic near-duplicates, `subject`-based
-conflict supersession, and the migration runner that a canonical key column
-needs. Ingestion, extraction, and all retrieval modes are complete for now.
+## Retrieval Evaluation & Benchmarks
+
+RecallKit includes a native retrieval evaluation engine (`app/evaluation`) inspired by TREC/BEIR evaluation methodologies. It scores precision, recall, mean reciprocal rank (MRR), and normalized discounted cumulative gain (nDCG) across all retrieval modes against versioned datasets.
+
+### Measured Ground-Truth Results (`eval/datasets/retrieval-v1.json`)
+
+Evaluated on 13 queries across 12 memories and 2 users using K ∈ {1, 3, 5}:
+
+| Mode | P@1 | P@3 | P@5 | R@1 | R@3 | R@5 | MRR | NDCG@1 | NDCG@3 | Scored | Misses |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Keyword (FTS5)** | 0.4444 | 0.1852 | 0.1111 | 0.3889 | 0.4444 | 0.4444 | 0.4444 | 0.4444 | 0.4444 | 9 | 5 |
+| **Semantic (Cosine)** | 0.7778 | 0.2593 | 0.1556 | 0.7778 | 0.7778 | 0.7778 | 0.7778 | 0.7778 | 0.7778 | 9 | 2 |
+| **Hybrid (RRF + Recency)** | **0.8889** | **0.3333** | **0.2000** | **0.8333** | **0.8889** | **0.8889** | **0.8889** | **0.8889** | **0.8800** | 9 | **1** |
+
+- **Integrity Violations**: 0 across all modes (zero cross-user leakage, zero forbidden hits, zero duplicate results).
+- **Abstention on Empty Targets**: 100% pass rate (2 out of 2 queries with no relevant answer correctly returned zero results).
+
+### Crucial Benchmark Caveat
+
+> **Important**: The benchmark figures above were generated using RecallKit's offline deterministic fake embedding provider (`recallkit-fake-hash-v1-256`). This provider hashes words and n-grams into a fixed-dimension vector to measure lexical overlap.
+>
+> While this guarantees 100% deterministic testing and validates pipeline mechanics (ranking algorithms, reciprocal rank fusion, coverage calculation, and isolation boundaries), **it does not measure semantic understanding or synonym awareness** (e.g. *"oat milk"* will not match *"dairy alternative"* under the fake provider).
+>
+> The 13-query synthetic dataset is designed as an indicative plumbing verification tool, not an industry-wide benchmark. To evaluate genuine semantic retrieval, run the evaluation command with an external embedding provider:
+> ```powershell
+> .\.venv\Scripts\python.exe -m app.cli evaluate --dataset eval/datasets/retrieval-v1.json --provider configured --allow-external-provider
+> ```
+
+---
+
+## API Reference
+
+| Method | Endpoint | Description |
+| :--- | :--- | :--- |
+| `GET` | `/health` | Service health status and SQLite connection check |
+| `POST` | `/memories` | Create a new memory (`user_id`, `content`, `kind`, `agent_id`) |
+| `GET` | `/memories` | List memories with pagination, search, kind, and status filters |
+| `GET` | `/memories/{id}` | Retrieve memory details by ID |
+| `PATCH` | `/memories/{id}` | Update content or kind of an active memory (409 if superseded) |
+| `DELETE` | `/memories/{id}` | Permanently delete a memory and its associated vectors |
+| `POST` | `/memories/{id}/supersede` | Explicitly retire a memory in favor of a replacement memory |
+| `GET` | `/memories/{id}/explain` | Return observed extraction provenance and candidate conflicts |
+| `POST` | `/memories/search` | Ranked search across active memories (`keyword`, `semantic`, `hybrid`) |
+| `POST` | `/conversations` | Ingest multi-turn chat and extract durable facts with idempotency |
+| `GET` | `/memory-conflicts` | List detected open or resolved memory conflict candidates |
+| `POST` | `/memory-conflicts/{id}/resolve` | Resolve conflict with `keep_a`, `keep_b`, `keep_both`, or `superseded` |
+| `POST` | `/memory-conflicts/scan` | Re-scan active memories for contradictory statements |
+| `GET` | `/dashboard/` | Developer dashboard interface |
+
+---
+
+## Security Disclosures & Known Limitations
+
+- **Caller-Asserted User Identity**: RecallKit does not provide an authentication layer (OAuth, JWT, API tokens). The `user_id` parameter is asserted by the caller. RecallKit is intended for local development or internal backend service-to-service communication behind an authenticated API gateway.
+- **Local Developer Dashboard**: The dashboard is intended strictly for localhost development. It has no access control or user authentication. Do not bind the server to `0.0.0.0` or expose the dashboard on untrusted networks.
+- **Data Retention & Privacy Deletion**: Calling `DELETE /memories/{id}` deletes the memory record, its vector embeddings, and its search index entries. However, it does not purge the historical receipt in `conversations.result_json` or raw messages (if `RECALLKIT_STORE_MESSAGES=true` is enabled).
+- **Prompt Injection Defense**: Memories stored in RecallKit are stored as raw text. Applications injecting recalled memories into downstream LLM prompts must sanitize or format memory content to protect against indirect prompt injection.
+- **Vector Search Scale**: Vector search performs an in-memory brute-force cosine similarity scan over candidate embeddings. This is optimal for low-latency personal agent memory (up to ~5,000 memories per user), but larger datasets will require an embedded vector extension (such as `sqlite-vec`).
+
+---
+
+## Project Status & Roadmap
+
+RecallKit is a solo-built project created for a startup/product hackathon. All foundational milestones (M1 through M3.6) are complete and verified.
+
+Planned future enhancements:
+- [ ] JWT / OAuth2 bearer token authentication and role-based access control.
+- [ ] Native vector indexing integration via `sqlite-vec` for scaling beyond 10,000 vectors per user.
+- [ ] Conversation scrubbing and GDPR-compliant retention purge endpoints.
+- [ ] Python and TypeScript client SDKs for agent frameworks (LangChain, LlamaIndex, CrewAI).
+
+---
+
+## Contributing & License
+
+Contributions, feedback, and issue reports are welcome. Please open an issue or pull request adhering to the existing code standards (100% type annotations, Ruff formatting, and comprehensive pytest coverage).
+
+**License Status**: No open source license has been selected yet. All rights reserved. (A standard permissive open source license such as MIT or Apache-2.0 will be selected prior to public distribution).
