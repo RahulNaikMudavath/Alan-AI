@@ -1,0 +1,201 @@
+{
+  "dataset_version": "retrieval-v1",
+  "schema_version": 1,
+  "users": ["eval-alice", "eval-bob"],
+  "memories": [
+    {
+      "local_id": "a-editor-old",
+      "user_id": "eval-alice",
+      "kind": "preference",
+      "content": "Prefers dark mode in the editor.",
+      "superseded_by": "a-editor-new",
+      "superseded_reason": "user_correction",
+      "supersession_rationale": "Same scope (editor theme) and same kind; the preference changed from dark to light. The old row is history and must not appear for current-theme queries."
+    },
+    {
+      "local_id": "a-editor-new",
+      "user_id": "eval-alice",
+      "kind": "preference",
+      "content": "Prefers light mode in the editor."
+    },
+    {
+      "local_id": "a-role",
+      "user_id": "eval-alice",
+      "kind": "fact",
+      "content": "Works as a backend engineer on payments."
+    },
+    {
+      "local_id": "a-coffee",
+      "user_id": "eval-alice",
+      "kind": "preference",
+      "content": "Drinks oat milk flat whites in the morning."
+    },
+    {
+      "local_id": "a-deploy",
+      "user_id": "eval-alice",
+      "kind": "event",
+      "content": "Deploys on Fridays at 3pm."
+    },
+    {
+      "local_id": "a-deploy-window",
+      "user_id": "eval-alice",
+      "kind": "fact",
+      "content": "The deployment window opens at 2:45pm on Fridays."
+    },
+    {
+      "local_id": "a-dog",
+      "user_id": "eval-alice",
+      "kind": "fact",
+      "content": "Owns a greyhound named Pixel."
+    },
+    {
+      "local_id": "a-docs",
+      "user_id": "eval-alice",
+      "kind": "preference",
+      "content": "Prefers editorial-style documentation with examples."
+    },
+    {
+      "local_id": "a-vim",
+      "user_id": "eval-alice",
+      "kind": "preference",
+      "content": "Uses Vim keybindings in VS Code."
+    },
+    {
+      "local_id": "a-pr",
+      "user_id": "eval-alice",
+      "kind": "event",
+      "content": "Reviews pull requests on Tuesday mornings."
+    },
+    {
+      "local_id": "b-key",
+      "user_id": "eval-bob",
+      "kind": "fact",
+      "content": "API key rotates on the first Monday of each month."
+    },
+    {
+      "local_id": "b-postgres",
+      "user_id": "eval-bob",
+      "kind": "preference",
+      "content": "Prefers Postgres for analytics workloads."
+    }
+  ],
+  "queries": [
+    {
+      "id": "q-coffee",
+      "category": "relevance",
+      "user_id": "eval-alice",
+      "query": "oat milk flat white",
+      "relevant": ["a-coffee"],
+      "must_not_include": [],
+      "rationale": "Same drink using the exact nouns; no other memory is about coffee."
+    },
+    {
+      "id": "q-role",
+      "category": "relevance",
+      "user_id": "eval-alice",
+      "query": "backend engineer working on payments",
+      "relevant": ["a-role"],
+      "must_not_include": [],
+      "rationale": "Meaning-preserving paraphrase of the role and domain: 'works as a backend engineer on payments'."
+    },
+    {
+      "id": "q-editor-theme",
+      "category": "relevance",
+      "user_id": "eval-alice",
+      "query": "current editor color theme preference",
+      "relevant": ["a-editor-new"],
+      "must_not_include": ["a-editor-old"],
+      "rationale": "Asks for the current editor theme. Light mode is an editor color theme and the replacement states it. The dark-mode row is the same subject but historical, so it must not appear."
+    },
+    {
+      "id": "q-docs",
+      "category": "relevance",
+      "user_id": "eval-alice",
+      "query": "documentation style that includes examples",
+      "relevant": ["a-docs"],
+      "must_not_include": [],
+      "rationale": "'editorial-style documentation' is a documentation style, and 'with examples' is explicit in the memory."
+    },
+    {
+      "id": "q-deploy",
+      "category": "relevance",
+      "user_id": "eval-alice",
+      "query": "Friday deploy",
+      "relevant": ["a-deploy", "a-deploy-window"],
+      "must_not_include": [],
+      "rationale": "Both memories describe Friday deployment facts. Someone asking about Friday deploys would want both."
+    },
+    {
+      "id": "q-dog",
+      "category": "relevance",
+      "user_id": "eval-alice",
+      "query": "greyhound named Pixel",
+      "relevant": ["a-dog"],
+      "must_not_include": [],
+      "rationale": "Exact subject and name; no other memory mentions a pet."
+    },
+    {
+      "id": "q-vim",
+      "category": "relevance",
+      "user_id": "eval-alice",
+      "query": "Vim keybindings",
+      "relevant": ["a-vim"],
+      "must_not_include": [],
+      "rationale": "Exact phrase from the memory."
+    },
+    {
+      "id": "q-pr",
+      "category": "relevance",
+      "user_id": "eval-alice",
+      "query": "pull request review schedule",
+      "relevant": ["a-pr"],
+      "must_not_include": [],
+      "rationale": "The memory says the user reviews pull requests on Tuesday mornings, which is the review schedule."
+    },
+    {
+      "id": "q-postgres",
+      "category": "relevance",
+      "user_id": "eval-bob",
+      "query": "analytics database preference",
+      "relevant": ["b-postgres"],
+      "must_not_include": [],
+      "rationale": "Postgres for analytics workloads is a database preference for analytics."
+    },
+    {
+      "id": "q-isolation-a",
+      "category": "isolation",
+      "user_id": "eval-alice",
+      "query": "API key rotation schedule",
+      "relevant": [],
+      "must_not_include": ["b-key"],
+      "rationale": "Alice has no memory about API keys. The query is unanswerable for her, and Bob's fact must never appear."
+    },
+    {
+      "id": "q-isolation-b",
+      "category": "isolation",
+      "user_id": "eval-bob",
+      "query": "oat milk flat white",
+      "relevant": [],
+      "must_not_include": ["a-coffee"],
+      "rationale": "Bob has no memory about coffee. This is the reverse isolation check."
+    },
+    {
+      "id": "q-no-answer-a",
+      "category": "no_answer",
+      "user_id": "eval-alice",
+      "query": "quantum chromodynamics lattice spacing",
+      "relevant": [],
+      "must_not_include": [],
+      "rationale": "No memory or plausible user fact concerns this topic. The ideal outcome is abstention."
+    },
+    {
+      "id": "q-no-answer-b",
+      "category": "no_answer",
+      "user_id": "eval-bob",
+      "query": "kubernetes ingress controller",
+      "relevant": [],
+      "must_not_include": [],
+      "rationale": "Off-topic for every memory. Returning results is allowed, but it is a restraint miss, not a correctness claim."
+    }
+  ]
+}

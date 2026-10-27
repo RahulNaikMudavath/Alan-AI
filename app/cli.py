@@ -6,10 +6,16 @@ Usage (PowerShell, from the project root):
     .\\.venv\\Scripts\\python.exe -m app.cli migrate --check
     .\\.venv\\Scripts\\python.exe -m app.cli migrate
     .\\.venv\\Scripts\\python.exe -m app.cli backfill-embeddings
+    .\\.venv\\Scripts\\python.exe -m app.cli seed-demo --user-id demo-user
+    .\\.venv\\Scripts\\python.exe -m app.cli evaluate --dataset eval/datasets/retrieval-v1.json
 
 Schema changes are never applied by application startup. ``init`` creates a
 database from nothing; ``migrate`` upgrades an existing one. Both are safe to
 rerun and report what they did.
+
+``seed-demo`` writes demo memories for the local dashboard. It never runs
+automatically, it refuses to touch a database whose schema is out of date, and
+it does nothing when the chosen user already has memories.
 
 Backfill only adds vectors for the *configured* model where none exist. It never
 overwrites an existing vector, never touches vectors belonging to another model,
@@ -22,11 +28,41 @@ from datetime import UTC, datetime
 
 from app.config import Settings
 from app.db import Database
+from app.evaluation.runner import DEFAULT_K_VALUES, MODES, evaluate_command
 from app.llm.base import EmbeddingProvider
-from app.llm.factory import build_embedding_provider
+from app.llm.factory import build_embedding_provider, build_llm_provider
 from app.migrations.runner import SchemaNotReadyError, latest_version
+from app.models import (
+    ConversationIngestRequest,
+    MemoryCreate,
+    SupersedeRequest,
+)
+from app.repositories.conflicts import ConflictRepository
+from app.repositories.conversations import ConversationRepository
 from app.repositories.embeddings import EmbeddingRepository
+from app.repositories.memories import MemoryRepository
 from app.retrieval.vectors import pack_vector
+from app.services.conflict_service import ConflictService
+from app.services.conversation_service import ConversationService
+from app.services.embedding_index import EmbeddingIndex
+from app.services.memory_service import MemoryService
+
+# Demo content for the local dashboard. It is synthetic and intentionally
+# includes one same-scope supersession and one explicit-negation pair so the
+# lifecycle and conflict views have something to show.
+_DEMO_MEMORIES = (
+    ("Prefers dark mode in the editor.", "preference"),
+    ("Prefers light mode in the editor.", "preference"),
+    ("Works as a backend engineer on payments.", "fact"),
+    ("Drinks oat milk flat whites in the morning.", "preference"),
+    ("Deploys on Fridays at 3pm.", "event"),
+    ("Owns a greyhound named Pixel.", "fact"),
+    ("Prefers editorial-style documentation with examples.", "preference"),
+    ("I like coffee.", "preference"),
+    ("I do not like coffee.", "preference"),
+)
+
+_DEMO_CONVERSATION = "demo-conversation-1"
 
 _BACKUP_REMINDER = (
     "Back up the database file and any -wal/-shm files before migrating.\n"
@@ -175,6 +211,111 @@ def backfill_embeddings(
     return 0 if failed == 0 else 1
 
 
+def seed_demo(settings: Settings, *, user_id: str = "demo-user") -> int:
+    """Create demo memories so the local dashboard has something to show.
+
+    Explicit command only. Refuses an out-of-date schema, does nothing when the
+    user already has memories, and skips the conversation sample when a real
+    (paid) extraction provider is configured.
+    """
+    database = Database(settings.database_path)
+    try:
+        database.require_current()
+    except SchemaNotReadyError as exc:
+        print(exc)
+        return 1
+
+    connection = database.connect()
+    provider = None
+    llm_provider = None
+    try:
+        if connection.execute(
+            "SELECT 1 FROM memories WHERE user_id = ? LIMIT 1", (user_id,)
+        ).fetchone():
+            print(f"User {user_id} already has memories. Nothing to seed.")
+            return 0
+
+        provider = build_embedding_provider(settings)
+        memories = MemoryRepository(connection)
+        embeddings = EmbeddingRepository(connection)
+        conflicts = ConflictRepository(connection)
+        index = EmbeddingIndex(repository=embeddings, provider=provider)
+        memory_service = MemoryService(memories, index, conflicts=conflicts, connection=connection)
+        conflict_service = ConflictService(
+            connection=connection, memories=memories, conflicts=conflicts, settings=settings
+        )
+
+        created = [
+            memory_service.remember(
+                MemoryCreate(
+                    user_id=user_id,
+                    content=content,
+                    kind=kind,
+                    agent_id="demo-agent",
+                )
+            )
+            for content, kind in _DEMO_MEMORIES
+        ]
+
+        # Same-scope supersession: the editor theme preference changed.
+        memory_service.supersede(
+            created[0].id,
+            user_id=user_id,
+            payload=SupersedeRequest(
+                superseded_by=created[1].id,
+                reason="user_correction",
+                note="Demo: the editor theme preference changed.",
+            ),
+        )
+
+        conversation_memories = 0
+        if settings.llm_provider == "fake":
+            llm_provider = build_llm_provider(settings)
+            if llm_provider is not None:
+                conversation_service = ConversationService(
+                    connection=connection,
+                    conversations=ConversationRepository(connection),
+                    memories=memories,
+                    memory_service=memory_service,
+                    provider=llm_provider,
+                    settings=settings,
+                    conflicts=conflict_service,
+                )
+                response, _ = conversation_service.ingest(
+                    ConversationIngestRequest(
+                        user_id=user_id,
+                        conversation_id=_DEMO_CONVERSATION,
+                        agent_id="demo-agent",
+                        messages=[{"role": "user", "content": "I'm vegetarian and I prefer tea."}],
+                    )
+                )
+                conversation_memories = len(response.memories_created)
+        else:
+            print(
+                "Skipping the conversation sample: the configured extraction "
+                "provider is not the offline fake."
+            )
+
+        conflict_service.detect_for_many(created)
+        open_conflicts = connection.execute(
+            "SELECT COUNT(*) FROM memory_conflicts WHERE user_id = ? AND status = 'open'",
+            (user_id,),
+        ).fetchone()[0]
+
+        print(
+            f"Seeded {len(created) + conversation_memories} memories for {user_id} "
+            f"(1 superseded, {open_conflicts} open conflict candidate, "
+            f"{conversation_memories} conversation-sourced)."
+        )
+        return 0
+    finally:
+        connection.close()
+        if provider is not None:
+            provider.close()
+        if llm_provider is not None:
+            llm_provider.close()
+
+
 def main(
     argv: list[str] | None = None,
     *,
@@ -205,7 +346,69 @@ def main(
     backfill.add_argument("--user-id", help="Only backfill one user's memories.")
     backfill.add_argument("--batch-size", type=int, default=50)
 
+    seed = subcommands.add_parser(
+        "seed-demo",
+        help="Create demo memories for the local dashboard. Never automatic.",
+    )
+    seed.add_argument("--user-id", default="demo-user")
+
+    evaluate = subcommands.add_parser(
+        "evaluate",
+        help="Run the retrieval evaluation offline and write a JSON report.",
+    )
+    evaluate.add_argument("--dataset", default="eval/datasets/retrieval-v1.json")
+    evaluate.add_argument("--modes", default=",".join(MODES))
+    evaluate.add_argument("--k", default=",".join(str(k) for k in DEFAULT_K_VALUES))
+    evaluate.add_argument("--repeat", type=int, default=3)
+    evaluate.add_argument("--only", help="Evaluate a single query ID.")
+    evaluate.add_argument("--output", help="Report path; defaults under eval/reports/.")
+    evaluate.add_argument("--database", help="Keep the seeded database at this path.")
+    evaluate.add_argument(
+        "--provider",
+        choices=["offline", "configured"],
+        default="offline",
+        help="offline forces the deterministic fake embedding provider.",
+    )
+    evaluate.add_argument(
+        "--allow-external-provider",
+        action="store_true",
+        help="Required to use the provider configured in the environment.",
+    )
+
     args = parser.parse_args(argv)
+
+    if args.command == "evaluate":
+        mode_list = [part.strip() for part in args.modes.split(",") if part.strip()]
+        if not mode_list or any(mode not in MODES for mode in mode_list):
+            print(f"invalid --modes; choose from {', '.join(MODES)}")
+            return 1
+        mode_list = list(dict.fromkeys(mode_list))
+        try:
+            k_values = sorted({int(part) for part in args.k.split(",") if part.strip()})
+        except ValueError:
+            print("invalid --k; expected comma-separated integers")
+            return 1
+        if not k_values or min(k_values) < 1 or max(k_values) > 50:
+            print("--k values must be between 1 and 50")
+            return 1
+        if args.repeat < 1:
+            print("--repeat must be positive")
+            return 1
+        if args.provider == "configured" and not args.allow_external_provider:
+            print("Refusing external provider evaluation without --allow-external-provider.")
+            return 1
+        return evaluate_command(
+            dataset_path=args.dataset,
+            modes=mode_list,
+            k_values=k_values,
+            repeat=args.repeat,
+            only=args.only,
+            output=args.output,
+            database=args.database,
+            provider_mode=args.provider,
+            allow_external=args.allow_external_provider,
+            settings=settings,
+        )
 
     if args.command == "init":
         return init_database(settings or Settings())
@@ -219,6 +422,10 @@ def main(
             user_id=args.user_id,
             batch_size=args.batch_size,
         )
+    if args.command == "seed-demo":
+        if not args.user_id.strip():
+            parser.error("--user-id must not be blank")
+        return seed_demo(settings or Settings(), user_id=args.user_id.strip())
     return 2
 
 
