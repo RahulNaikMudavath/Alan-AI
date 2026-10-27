@@ -28,8 +28,15 @@ from app.retrieval.vectors import pack_vector
 
 
 @pytest.fixture(autouse=True)
-def no_network(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Fail any test that opens an outbound network connection."""
+def no_network(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest) -> None:
+    """Fail any test that opens an outbound network connection.
+
+    Tests that must talk to a local process (the opt-in browser suite) declare
+    ``@pytest.mark.allow_network``. Nothing else may opt out, so the offline
+    guarantee still covers the whole suite by default.
+    """
+    if request.node.get_closest_marker("allow_network") is not None:
+        return
 
     def guard(*args: object, **kwargs: object) -> None:
         raise AssertionError("network access is not allowed in tests")

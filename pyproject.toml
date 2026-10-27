@@ -2,6 +2,9 @@
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+markers = [
+    "allow_network: opt out of the offline socket guard (local browser tests only)",
+]
 
 [tool.ruff]
 line-length = 100
